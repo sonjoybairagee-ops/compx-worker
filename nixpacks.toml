@@ -1,0 +1,37 @@
+[phases.setup]
+nixPkgs = [
+  "chromium",
+  "nss",
+  "freetype",
+  "freetype.dev",
+  "harfbuzz",
+  "ca-certificates",
+  "ttf-dejavu",
+  "xorg.libXcomposite",
+  "xorg.libXdamage",
+  "xorg.libXrandr",
+  "xorg.libXcursor",
+  "xorg.libX11",
+  "xorg.libxcb",
+  "xorg.libXext",
+  "xorg.libXfixes",
+  "xorg.libXrender",
+  "xorg.libXtst",
+  "xorg.libXScrnSaver",
+  "glib",
+  "gtk3",
+  "pango",
+  "atk",
+  "cups",
+  "dbus",
+  "expat",
+  "fontconfig",
+  "libdrm",
+  "mesa"
+]
+
+[phases.build]
+cmds = ["npm install"]
+
+[start]
+cmd = "node src/index.js"
