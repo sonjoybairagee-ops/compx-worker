@@ -181,7 +181,7 @@ async function deepScrapeYellowPages(page, inputData) {
 export async function runDeepScrape(inputData, userId) {
   const { source, url, leadId, name, proxyUrl } = inputData;
 
-  console.log(`[DeepScrape] Starting: ${source} — ${name || url} ${proxyUrl ? \`(proxy: ${proxyUrl})\` : "(no proxy)"}`);
+  console.log(`[DeepScrape] Starting: ${source} — ${name || url} ${proxyUrl ? "(proxy: " + proxyUrl + ")" : "(no proxy)"}`);
 
   const browser = await puppeteer.launch({
     headless:        "new",
