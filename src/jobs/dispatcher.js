@@ -5,8 +5,8 @@ import { supabase } from "../config/supabase.js"
 import { runEnrichJob }      from "./enrichJob.js"
 import { runDeepScrape }     from "./deepScrapeJob.js"
 import { runVerifyEmail }    from "./verifyEmailJob.js"
-import { getBestProxy, markProxyFail, markProxySuccess } from "../../../lib/proxy.js"
-import { analyzeJobRisk } from "../../../lib/routingEngine.js"
+import { getBestProxy, markProxyFail, markProxySuccess } from "../../lib/proxy.js"
+import { analyzeJobRisk } from "../../lib/routingEngine.js"
 
 // ── Normalize domain ──────────────────────────────────────────────────────────
 function normalizeDomain(raw) {
