@@ -1,17 +1,17 @@
 /**
  * CompX Worker — src/jobs/deepScrapeJob.js
- * Deep scrape using Puppeteer with anti-bot techniques
+ * Deep scrape using Puppeteer with anti-bot techniques + proxy support
  *
  * PhantomBuster method:
  * 1. Stealth mode (no webdriver fingerprint)
  * 2. Human-like delays + mouse movement
  * 3. Random viewport + user agent
- * 4. Cookie + session reuse
+ * 4. Proxy injection
  * 5. Pagination handling
  */
 
 import puppeteer from "puppeteer";
-import { supabase } from "../index.js";
+import { supabase } from "../config/supabase.js";
 
 // ── Anti-bot: random human delay ─────────────────────────────────────────────
 const humanDelay = (min = 800, max = 2500) =>
@@ -35,6 +35,16 @@ const USER_AGENTS = [
 
 function randomUA() {
   return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+}
+
+// ── Build launch args with optional proxy ─────────────────────────────────────
+function buildLaunchArgs(proxyUrl) {
+  const args = [...STEALTH_ARGS];
+  if (proxyUrl) {
+    args.push(`--proxy-server=${proxyUrl}`);
+    console.log(`[DeepScrape] Using proxy: ${proxyUrl}`);
+  }
+  return args;
 }
 
 // ── Stealth page setup ────────────────────────────────────────────────────────
@@ -61,7 +71,11 @@ async function setupStealthPage(browser) {
     const url  = req.url();
     const type = req.resourceType();
     if (type === "image" || type === "font" || type === "media") { req.abort(); return; }
-    if (url.includes("doubleclick") || url.includes("googlesyndication") || url.includes("analytics")) { req.abort(); return; }
+    if (
+      url.includes("doubleclick") ||
+      url.includes("googlesyndication") ||
+      url.includes("analytics")
+    ) { req.abort(); return; }
     req.continue();
   });
 
@@ -79,7 +93,7 @@ async function deepScrapeGoogleMaps(page, inputData) {
 
   const results = [];
 
-  // Scroll to load more
+  // Scroll to load more results
   const feed = await page.$('div[role="feed"]');
   if (feed) {
     for (let i = 0; i < 5; i++) {
@@ -102,11 +116,11 @@ async function deepScrapeGoogleMaps(page, inputData) {
         const getAttr = (sel, attr) => document.querySelector(sel)?.getAttribute(attr) || "";
 
         return {
-          name:    getText("h1.DUwDvf") || getText("h1"),
-          phone:   getAttr('button[data-item-id^="phone:tel:"]', "data-item-id")?.replace("phone:tel:", "") || getText(".phone"),
-          address: getText('button[data-item-id="address"]'),
-          website: getAttr('a[data-item-id="authority"]', "href"),
-          rating:  getText(".F7nice span"),
+          name:     getText("h1.DUwDvf") || getText("h1"),
+          phone:    getAttr('button[data-item-id^="phone:tel:"]', "data-item-id")?.replace("phone:tel:", "") || getText(".phone"),
+          address:  getText('button[data-item-id="address"]'),
+          website:  getAttr('a[data-item-id="authority"]', "href"),
+          rating:   getText(".F7nice span"),
           category: getText(".DkEaL"),
         };
       });
@@ -140,7 +154,7 @@ async function deepScrapeYellowPages(page, inputData) {
         card.querySelector(".locality, .city")?.innerText?.trim(),
         card.querySelector(".region, .state")?.innerText?.trim(),
       ].filter(Boolean).join(", ");
-      const category = card.querySelector(".categories a")?.innerText?.trim() || "";
+      const category  = card.querySelector(".categories a")?.innerText?.trim() || "";
       const websiteEl = card.querySelector("a.track-visit-website");
       let website = "";
       if (websiteEl) {
@@ -153,8 +167,8 @@ async function deepScrapeYellowPages(page, inputData) {
         } else { website = href; }
       }
       const ratingCls = card.querySelector("[class*='rating']")?.className || "";
-      const rm = ratingCls.match(/rated?-(\d)/i);
-      const rating = rm ? rm[1] : "";
+      const rm        = ratingCls.match(/rated?-(\d)/i);
+      const rating    = rm ? rm[1] : "";
 
       return { name, phone, address, category, website, rating };
     }).filter(r => r.name);
@@ -165,14 +179,13 @@ async function deepScrapeYellowPages(page, inputData) {
 
 // ── Main deep scrape job ──────────────────────────────────────────────────────
 export async function runDeepScrape(inputData, userId) {
-  const { source, url, leadId, name } = inputData;
+  const { source, url, leadId, name, proxyUrl } = inputData;
 
-  console.log(`[DeepScrape] Starting: ${source} — ${name || url}`);
+  console.log(`[DeepScrape] Starting: ${source} — ${name || url} ${proxyUrl ? \`(proxy: ${proxyUrl})\` : "(no proxy)"}`);
 
   const browser = await puppeteer.launch({
-    headless:        true,
-    executablePath:  process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-    args:            STEALTH_ARGS,
+    headless:        "new",
+    args:            buildLaunchArgs(proxyUrl),  // ← proxy injected here
     defaultViewport: null,
   });
 
@@ -199,38 +212,23 @@ export async function runDeepScrape(inputData, userId) {
 
     console.log(`[DeepScrape] Done: ${results.length} results`);
 
-    // Store deep-scraped results to Supabase
+    // Store results to Supabase
     if (results.length > 0 && userId) {
-      const rows = results.map(r => {
-        const companyName = r.name || "Unknown";
-        const website = r.website || "";
-        const phone = r.phone || "";
-        const uniqueStr = `${source}-${companyName}-${website}-${phone}`.toLowerCase().replace(/\s+/g, "");
-        let hashNum = 0;
-        for (let i = 0; i < uniqueStr.length; i++) {
-          hashNum = ((hashNum << 5) - hashNum) + uniqueStr.charCodeAt(i);
-          hashNum |= 0;
-        }
-        const hash = Math.abs(hashNum).toString(36);
-        return {
-          hash,
-          user_id:      userId,
-          source,
-          company_name: companyName,
-          phone:        phone || null,
-          address:      r.address || null,
-          website:      website || null,
-          category:     r.category || null,
-          industry:     r.category || null,
-          rating:       r.rating ? parseFloat(r.rating) : null,
-          scraped_at:   Date.now(),
-          created_at:   new Date().toISOString(),
-        };
-      });
+      const rows = results.map(r => ({
+        user_id:      userId,
+        source:       source,
+        company_name: r.name    || "Unknown",
+        phone:        r.phone   || null,
+        address:      r.address || null,
+        website:      r.website || null,
+        category:     r.category || null,
+        rating:       r.rating ? parseFloat(r.rating) : null,
+        scraped_at:   new Date().toISOString(),
+      }));
 
       const { error } = await supabase
         .from("extension_database")
-        .upsert(rows, { onConflict: "hash,user_id", ignoreDuplicates: true });
+        .upsert(rows, { onConflict: "hash" });
 
       if (error) console.error("[DeepScrape] Supabase error:", error.message);
       else       console.log(`[DeepScrape] Stored ${rows.length} leads`);

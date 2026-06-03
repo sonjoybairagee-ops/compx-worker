@@ -10,20 +10,27 @@
 import "dotenv/config";
 import { Worker, Queue } from "bullmq";
 import IORedis from "ioredis";
-import { createClient } from "@supabase/supabase-js";
 import { runEnrichJob }    from "./jobs/enrichJob.js";
 import { runDeepScrape }   from "./jobs/deepScrapeJob.js";
 import { runVerifyEmail }  from "./jobs/verifyEmailJob.js";
+import { runWebhookJob }   from "./jobs/webhookJob.js";
 import { pollSupabaseJobs } from "./poller.js";
+import { analyzeJobRisk, updateBrainFeedback } from "../../lib/scrapingBrain.js";
+import { getBestProxy } from "../../lib/proxy.js";
+import express from "express";
+import { createBullBoardRouter } from "./config/bullBoard.js";
+import { attachDLQListener } from "./config/dlqHandler.js";
+
+// helper
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const REDIS_URL     = process.env.REDIS_URL     || "redis://localhost:6379";
-const SUPABASE_URL  = process.env.NEXT_PUBLIC_SUPABASE_URL;
-const SUPABASE_KEY  = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const CONCURRENCY   = parseInt(process.env.WORKER_CONCURRENCY || "3");
 
-// ── Supabase client ───────────────────────────────────────────────────────────
-export const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+import { supabase } from "./config/supabase.js";
 
 // ── Redis connection ──────────────────────────────────────────────────────────
 // Upstash requires TLS — rediss:// URL handles this automatically
@@ -50,48 +57,84 @@ export const jobQueue = new Queue("compx-jobs", { connection: redis });
 async function processJob(job) {
   const { type, input_data, user_id } = job.data;
 
-  console.log(`[Worker] Processing job ${job.id} — type: ${type} — ${input_data?.name || input_data?.website || ""}`);
+  // ── Routing decision ──────────────────────────────────────
+  const routingCtx = {
+    domain: input_data?.website || input_data?.domain,
+    country: input_data?.country,
+    type,
+  };
+  const routing = analyzeJobRisk(routingCtx);
+  const proxy = getBestProxy(routing);
 
-  // Update status to running in Supabase
+  console.log(`[Worker] Job ${job.id} → risk:${routing.riskLevel} geo:${routing.preferredGeo} proxy:${proxy?.id}`);
+
+  // delay based on risk level
+  await sleep(routing.delayMs);
+
+  // status update
   await supabase
     .from("jobs")
     .update({ status: "running", started_at: new Date().toISOString() })
     .eq("id", job.id);
 
+  // ── Execute with proxy + track result ─────────────────────
+  const startTime = Date.now();
   let result = null;
 
-  switch (type) {
-    case "enrich":
-      result = await runEnrichJob(input_data, user_id);
-      break;
-    case "deep_scrape":
-      result = await runDeepScrape(input_data, user_id);
-      break;
-    case "verify_email":
-      result = await runVerifyEmail(input_data, user_id);
-      break;
-    default:
-      throw new Error(`Unknown job type: ${type}`);
+  try {
+    switch (type) {
+      case "enrich":
+        result = await runEnrichJob(input_data, user_id, proxy);
+        break;
+      case "deep_scrape":
+        result = await runDeepScrape(input_data, user_id, proxy);
+        break;
+      case "verify_email":
+        result = await runVerifyEmail(input_data, user_id);
+        break;
+      case "webhook":
+        result = await runWebhookJob(input_data);
+        break;
+      default:
+        throw new Error(`Unknown job type: ${type}`);
+    }
+
+    // proxy success feedback
+    if (proxy) {
+      await updateBrainFeedback({
+        proxyId: proxy.id,
+        success: true,
+        latency: Date.now() - startTime,
+        domain: routingCtx.domain
+      });
+    }
+
+  } catch (err) {
+    // proxy fail feedback
+    if (proxy) {
+      await updateBrainFeedback({
+        proxyId: proxy.id,
+        success: false,
+        domain: routingCtx.domain
+      });
+    }
+    throw err;
   }
 
-  // Mark done + save output
   await supabase
     .from("jobs")
-    .update({
-      status:       "done",
-      output_data:  result,
-      completed_at: new Date().toISOString(),
-    })
+    .update({ status: "done", output_data: result, completed_at: new Date().toISOString() })
     .eq("id", job.id);
 
-  console.log(`[Worker] ✓ Job ${job.id} done — ${type}`);
   return result;
 }
 
 // ── BullMQ Worker ─────────────────────────────────────────────────────────────
 const worker = new Worker("compx-jobs", processJob, {
-  connection:  redis,
-  concurrency: CONCURRENCY,
+  connection:      redis,
+  concurrency:     CONCURRENCY,
+  stalledInterval: 30_000, // Redis-এ check প্রতি ৩০ সেকেন্ডে (আগে ~১ সেকেন্ড ছিল)
+  lockDuration:    30_000, // job lock ৩০ সেকেন্ড থাকবে
   limiter: {
     max:      10,
     duration: 60_000, // max 10 jobs per minute — anti-block
@@ -106,14 +149,16 @@ worker.on("failed", async (job, err) => {
   console.error(`[Worker] ✗ Job ${job?.id} failed:`, err.message);
 
   if (job) {
+    const isFinal = job.attemptsMade >= (job.opts.attempts ?? 3);
+    
     await supabase
       .from("jobs")
       .update({
-        status:     job.attemptsMade >= 3 ? "failed" : "pending",
+        status:     isFinal ? "failed" : "pending",
         error:      err.message,
         retry_count: job.attemptsMade,
       })
-      .eq("id", job.id);
+      .eq("id", job.data.id || job.id);
   }
 });
 
@@ -121,10 +166,19 @@ worker.on("error", err => {
   console.error("[Worker] Worker error:", err.message);
 });
 
+// ── DLQ: সব retry শেষ হলে failed job DLQ-তে পাঠাও ──
+attachDLQListener(worker, "compx-jobs");
+
 // ── Supabase poller (fallback if Redis unavailable) ────────────────────────────
 // Polls jobs table every 10s and enqueues pending jobs to BullMQ
 pollSupabaseJobs(jobQueue, supabase);
 
 console.log(`[Worker] 🚀 CompX Worker started — concurrency: ${CONCURRENCY}`);
 console.log(`[Worker] Redis: ${REDIS_URL}`);
-console.log(`[Worker] Supabase: ${SUPABASE_URL}`);
+
+// ── Bull-Board Admin Dashboard ─────────────────────────────
+const app = express();
+app.use("/admin/queues", createBullBoardRouter());
+app.listen(3001, () => {
+  console.log("[Worker] 📊 Bull-Board: http://localhost:3001/admin/queues");
+});

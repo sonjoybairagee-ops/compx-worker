@@ -10,8 +10,8 @@
  * 5. Store enriched data back to Supabase
  */
 
-import { PuppeteerCrawler, Configuration } from "crawlee";
-import { supabase } from "../index.js";
+import { PuppeteerCrawler, CheerioCrawler, Configuration, ProxyConfiguration } from "crawlee";
+import { supabase } from "../config/supabase.js";
 
 // Contact page paths to try
 const CONTACT_PATHS = [
@@ -117,7 +117,7 @@ function extractSchemaOrg(html) {
 
 // ── Main enrichment job ───────────────────────────────────────────────────────
 export async function runEnrichJob(inputData, userId) {
-  const { website, name, leadId, hints = {} } = inputData;
+  const { website, name, leadId, hints = {}, proxyUrl } = inputData;
 
   if (!website) {
     console.warn("[EnrichJob] No website provided");
@@ -132,12 +132,18 @@ export async function runEnrichJob(inputData, userId) {
   const result = {
     domain,
     emails:      [],
+    work_email:  null,
+    personal_email: null,
     phones:      [],
     socials:     {},
     techStack:   [],
     description: "",
     schema:      {},
     crawledPages: [],
+    // Badges
+    phone_found: false,
+    linkedin_matched: false,
+    crm_ready:   false,
     enrichedAt:  new Date().toISOString(),
   };
 
@@ -150,104 +156,164 @@ export async function runEnrichJob(inputData, userId) {
   const allEmails = new Set();
   const allPhones = new Set();
 
-  // ── Crawlee PuppeteerCrawler ──────────────────────────────────────────────
-  const crawler = new PuppeteerCrawler({
+  // Proxy configuration
+  const proxyConfiguration = proxyUrl ? new ProxyConfiguration({ proxyUrls: [proxyUrl] }) : undefined;
+
+  // ── Crawlee CheerioCrawler (Phase 1A: Fast HTML Scrape) ───────────────────
+  let cheerioSuccess = false;
+  
+  const cheerioCrawler = new CheerioCrawler({
+    proxyConfiguration,
     maxRequestsPerCrawl: 6,
-    maxConcurrency: 2,
-    requestHandlerTimeoutSecs: 20,
+    maxConcurrency: 4,
+    requestHandlerTimeoutSecs: 15,
+    async requestHandler({ request, $, body }) {
+      const url = request.url;
+      const html = body.toString();
+      const text = $("body").text();
 
-    // Network interception — Apollo.io method
-    preNavigationHooks: [
-      async ({ page }) => {
-        await page.setRequestInterception(true);
-        page.on("request", req => {
-          const rt = req.resourceType();
-          // Block images, fonts, media — only need HTML + XHR + fetch
-          if (["image","font","media","stylesheet"].includes(rt)) {
-            req.abort();
-          } else {
-            req.continue();
-          }
-        });
-
-        // Intercept XHR/fetch responses for API data
-        page.on("response", async res => {
-          try {
-            const ct = res.headers()["content-type"] || "";
-            if (ct.includes("json") && res.status() === 200) {
-              const text = await res.text().catch(() => "");
-              // Look for email patterns in API responses
-              extractEmails(text).forEach(e => allEmails.add(e));
-            }
-          } catch {}
-        });
-      },
-    ],
-
-    async requestHandler({ request, page, enqueueLinks }) {
-      const url  = request.url;
-      const html = await page.content();
-      const text = await page.evaluate(() => document.body?.innerText || "");
-
-      // Extract emails
       extractEmails(html + " " + text).forEach(e => allEmails.add(e));
       extractPhones(text).forEach(p => allPhones.add(p));
 
-      // Extract mailto links
-      const mailtos = await page.$$eval("a[href^='mailto:']", els =>
-        els.map(el => el.href.replace("mailto:", "").split("?")[0].toLowerCase())
-      );
-      mailtos.filter(e => !isJunkEmail(e)).forEach(e => allEmails.add(e));
+      $("a[href^='mailto:']").each((_, el) => {
+        const e = $(el).attr("href")?.replace("mailto:", "").split("?")[0].toLowerCase();
+        if (e && !isJunkEmail(e)) allEmails.add(e);
+      });
 
-      // Tech stack + socials (only on homepage)
       if (url === baseUrl || url === baseUrl + "/") {
         result.techStack = detectTechStack(html);
         result.socials   = extractSocials(html);
         result.schema    = extractSchemaOrg(html);
-        // Description from meta
-        result.description = await page.$eval(
-          'meta[name="description"], meta[property="og:description"]',
-          el => el.getAttribute("content") || ""
-        ).catch(() => "");
+        result.description = $('meta[name="description"], meta[property="og:description"]').attr("content") || "";
       }
 
       result.crawledPages.push(url);
-      console.log(`[EnrichJob] Crawled ${url} — emails: ${allEmails.size}`);
-
-      // Stop early if we have enough emails
-      if (allEmails.size >= 3 && url !== baseUrl) return;
+      console.log(`[EnrichJob] Cheerio crawled ${url} — emails: ${allEmails.size}`);
+      cheerioSuccess = true;
     },
-
     failedRequestHandler({ request, error }) {
-      // Silent — page may not exist (404 contact pages etc)
-      console.warn(`[EnrichJob] Failed: ${request.url} — ${error.message}`);
+      console.warn(`[EnrichJob] Cheerio Failed: ${request.url} — ${error.message}`);
     },
   }, new Configuration({ persistStorage: false }));
 
   try {
-    await crawler.run(urlsToCrawl);
+    await cheerioCrawler.run(urlsToCrawl);
   } catch (err) {
-    console.error("[EnrichJob] Crawler error:", err.message);
+    console.error("[EnrichJob] Cheerio error:", err.message);
   }
 
-  result.emails = [...allEmails].slice(0, 8);
-  result.phones = [...allPhones].slice(0, 5);
+  // ── Crawlee PuppeteerCrawler (Phase 1B: SPA Fallback) ─────────────────────
+  if (allEmails.size === 0 || !cheerioSuccess) {
+    console.log(`[EnrichJob] Cheerio found no data or failed. Falling back to Puppeteer...`);
+    const puppeteerCrawler = new PuppeteerCrawler({
+      proxyConfiguration,
+      maxRequestsPerCrawl: 6,
+      maxConcurrency: 2,
+      requestHandlerTimeoutSecs: 25,
+      preNavigationHooks: [
+        async ({ page }) => {
+          await page.setRequestInterception(true);
+          page.on("request", req => {
+            const rt = req.resourceType();
+            if (["image","font","media","stylesheet"].includes(rt)) req.abort();
+            else req.continue();
+          });
+          page.on("response", async res => {
+            try {
+              const ct = res.headers()["content-type"] || "";
+              if (ct.includes("json") && res.status() === 200) {
+                const text = await res.text().catch(() => "");
+                extractEmails(text).forEach(e => allEmails.add(e));
+              }
+            } catch {}
+          });
+        },
+      ],
+      async requestHandler({ request, page }) {
+        const url  = request.url;
+        const html = await page.content();
+        const text = await page.evaluate(() => document.body?.innerText || "");
 
-  // Merge schema data
+        extractEmails(html + " " + text).forEach(e => allEmails.add(e));
+        extractPhones(text).forEach(p => allPhones.add(p));
+
+        const mailtos = await page.$$eval("a[href^='mailto:']", els =>
+          els.map(el => el.href.replace("mailto:", "").split("?")[0].toLowerCase())
+        );
+        mailtos.filter(e => !isJunkEmail(e)).forEach(e => allEmails.add(e));
+
+        if (url === baseUrl || url === baseUrl + "/") {
+          if (!result.techStack.length) result.techStack = detectTechStack(html);
+          if (!Object.keys(result.socials).length) result.socials = extractSocials(html);
+          if (!Object.keys(result.schema).length) result.schema = extractSchemaOrg(html);
+          if (!result.description) {
+            result.description = await page.$eval(
+              'meta[name="description"], meta[property="og:description"]',
+              el => el.getAttribute("content") || ""
+            ).catch(() => "");
+          }
+        }
+        if (!result.crawledPages.includes(url)) result.crawledPages.push(url);
+        console.log(`[EnrichJob] Puppeteer crawled ${url} — emails: ${allEmails.size}`);
+        if (allEmails.size >= 3 && url !== baseUrl) return;
+      },
+      failedRequestHandler({ request, error }) {
+        console.warn(`[EnrichJob] Puppeteer Failed: ${request.url} — ${error.message}`);
+      },
+    }, new Configuration({ persistStorage: false }));
+
+    try {
+      await puppeteerCrawler.run(urlsToCrawl);
+    } catch (err) {
+      console.error("[EnrichJob] Puppeteer Crawler error:", err.message);
+    }
+  }
+
+  // ── Phase 2: Email Discovery & Classification ─────────────────────────────
+  result.emails = [...allEmails].slice(0, 8);
   if (result.schema.email && !isJunkEmail(result.schema.email)) {
     result.emails.unshift(result.schema.email);
     result.emails = [...new Set(result.emails)];
   }
 
-  console.log(`[EnrichJob] Done: ${domain} — ${result.emails.length} emails, tech: ${result.techStack.join(", ")}`);
+  const workEmails = result.emails.filter(e => e.endsWith(`@${domain}`));
+  const personalEmails = result.emails.filter(e => !e.endsWith(`@${domain}`) && !e.startsWith("info") && !e.startsWith("contact") && !e.startsWith("support") && !e.startsWith("sales"));
+  
+  result.work_email = workEmails[0] || null;
+  result.personal_email = personalEmails[0] || null;
+
+  // ── Phase 3: Phone Lookup ────────────────────────────────────────────────
+  result.phones = [...allPhones].slice(0, 5);
+  const finalPhone = result.schema.phone || result.phones[0] || null;
+  if (finalPhone) result.phone_found = true;
+
+  // ── Phase 4: Social Profiles ─────────────────────────────────────────────
+  if (result.socials.linkedin) result.linkedin_matched = true;
+
+  // ── Phase 5: Contact Details ─────────────────────────────────────────────
+  const finalDescription = result.schema.description || result.description || null;
+  const companyName = result.schema.name || name || null;
+
+  // ── Phase 6: Badge Assignment & CRM Readiness ────────────────────────────
+  // CRM ready if it has at least a work email, company name, and either phone or linkedin
+  if (result.work_email && companyName && (result.phone_found || result.linkedin_matched)) {
+    result.crm_ready = true;
+  }
+
+  console.log(`[EnrichJob] Done: ${domain} — CRM Ready: ${result.crm_ready}, Emails: ${result.emails.length}`);
 
   // ── Store enriched data back to Supabase ──────────────────────────────────
-  if (leadId && result.emails.length > 0) {
+  if (leadId && (result.emails.length > 0 || result.phone_found || result.linkedin_matched)) {
     const updateData = {
-      email:        result.emails[0] || null,
-      phone:        result.schema.phone || result.phones[0] || null,
-      description:  result.schema.description || result.description || null,
-      linkedin_url: result.socials.linkedin || null,
+      email:            result.work_email || result.emails[0] || null,
+      work_email:       result.work_email,
+      personal_email:   result.personal_email,
+      phone:            finalPhone,
+      description:      finalDescription,
+      linkedin_url:     result.socials.linkedin || null,
+      phone_found:      result.phone_found,
+      linkedin_matched: result.linkedin_matched,
+      crm_ready:        result.crm_ready
     };
 
     // Update by hash (leadId is the hash from background.js)
@@ -257,7 +323,7 @@ export async function runEnrichJob(inputData, userId) {
       .eq("hash", leadId)
       .eq("user_id", userId);
 
-    console.log(`[EnrichJob] Updated lead ${leadId} with email: ${result.emails[0]}`);
+    console.log(`[EnrichJob] Updated lead ${leadId} with badges (CRM Ready: ${result.crm_ready})`);
   }
 
   return result;

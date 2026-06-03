@@ -12,8 +12,7 @@
  */
 
 import dns from "dns/promises";
-import net from "net";
-import { supabase } from "../index.js";
+import { supabase } from "../config/supabase.js";
 
 // ── Disposable domains ────────────────────────────────────────────────────────
 const DISPOSABLE = new Set([
@@ -39,47 +38,30 @@ async function getMX(domain) {
   }
 }
 
-// ── SMTP handshake (NeverBounce core method) ──────────────────────────────────
-async function smtpCheck(email, mxHost) {
-  return new Promise(resolve => {
-    const timeout = setTimeout(() => {
-      socket.destroy();
-      resolve({ status: "timeout", code: null });
-    }, 10000);
+// ── ZeroBounce API (Replaces SMTP Port 25) ──────────────────────────────────
+async function zeroBounceCheck(email) {
+  const KEY = process.env.ZEROBOUNCE_API_KEY;
+  if (!KEY) {
+    console.warn("[VerifyEmail] ZEROBOUNCE_API_KEY is not set. Skipping API validation.");
+    return { status: "unknown", code: null };
+  }
 
-    const socket = net.createConnection(25, mxHost);
-    let step   = 0;
-    let buffer = "";
-
-    const send = cmd => socket.write(`${cmd}\r\n`);
-
-    socket.on("data", data => {
-      buffer += data.toString();
-      const lines = buffer.split("\r\n");
-      buffer = lines.pop() || "";
-
-      for (const line of lines) {
-        const code = parseInt(line.slice(0, 3));
-        if (step === 0 && code === 220) { step = 1; send("EHLO compxleads.io"); }
-        else if (step === 1 && (code === 250 || code === 220)) { step = 2; send("MAIL FROM:<verify@compxleads.io>"); }
-        else if (step === 2 && code === 250) { step = 3; send(`RCPT TO:<${email}>`); }
-        else if (step === 3) {
-          clearTimeout(timeout);
-          socket.write("QUIT\r\n");
-          socket.destroy();
-          resolve({
-            status: code === 250 ? "valid" : (code >= 550 && code < 560) ? "invalid" : "catch-all",
-            code,
-          });
-        }
-      }
-    });
-
-    socket.on("error", err => {
-      clearTimeout(timeout);
-      resolve({ status: "error", code: null, message: err.message });
-    });
-  });
+  try {
+    const res = await fetch(
+      `https://api.zerobounce.net/v2/validate?api_key=${KEY}&email=${email}`
+    );
+    const data = await res.json();
+    
+    // ZeroBounce returns: valid, invalid, catch-all, unknown, spamtrap, abuse, do_not_mail
+    return { 
+      status: data.status === "valid" ? "valid" : 
+              data.status === "invalid" ? "invalid" : 
+              data.status === "catch-all" ? "catch-all" : "unknown",
+      code: data.sub_status 
+    };
+  } catch (error) {
+    return { status: "error", code: null, message: error.message };
+  }
 }
 
 // ── Pattern confidence score ──────────────────────────────────────────────────
@@ -119,13 +101,10 @@ async function verifyOne(email) {
   result.checks.hasMX = mx.length > 0;
   if (!result.checks.hasMX) { result.status = "invalid"; result.score = 0; return result; }
 
-  // Layer 4: SMTP (try top 2 MX hosts)
-  for (const host of mx.slice(0, 2)) {
-    const smtp = await smtpCheck(email, host);
-    result.checks.smtp     = smtp.status;
-    result.checks.smtpCode = smtp.code;
-    if (smtp.status !== "error" && smtp.status !== "timeout") break;
-  }
+  // Layer 4: API Validation (ZeroBounce)
+  const apiCheck = await zeroBounceCheck(email);
+  result.checks.smtp     = apiCheck.status;
+  result.checks.smtpCode = apiCheck.code;
 
   // Layer 5: Score
   const base   = result.checks.syntax ? 30 : 0;
