@@ -10,6 +10,8 @@
     "build":  "tsc"
   },
   "dependencies": {
+    "@bull-board/api":                 "^5.10.0",
+    "@bull-board/express":             "^5.10.0",
     "@supabase/supabase-js":           "^2.39.0",
     "bullmq":                          "^5.0.0",
     "crawlee":                         "^3.9.0",
