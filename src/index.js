@@ -103,6 +103,10 @@ async function processJob(job) {
       default:
         throw new Error(`Unknown job type: ${type}`);
     }
+    case "google-maps-scrape":
+case "discover_scrape":
+  result = await runDiscoverScrape(input_data, user_id, job.id, proxy);
+  break;
 
     // proxy success feedback
     if (proxy) {
