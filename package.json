@@ -4,27 +4,28 @@
   "description": "CompX Unified Worker — Scraping + Enrichment + Email Verify",
   "type": "module",
   "scripts": {
-    "start":  "npx tsx src/index.js",
-    "dev":    "npx tsx watch src/index.js",
+    "start": "npx tsx src/index.js",
+    "dev": "npx tsx watch src/index.js",
     "worker": "npx tsx src/index.js",
-    "build":  "tsc"
+    "build": "tsc"
   },
   "dependencies": {
-    "@bull-board/api":                 "^5.10.0",
-    "@bull-board/express":             "^5.10.0",
-    "@supabase/supabase-js":           "^2.39.0",
-    "bullmq":                          "^5.0.0",
-    "crawlee":                         "^3.9.0",
-    "dotenv":                          "^16.4.0",
-    "express":                         "^4.18.0",
-    "ioredis":                         "^5.3.0",
-    "playwright-extra":                "^4.3.6",
-    "puppeteer":                       "^22.0.0",
-    "puppeteer-extra-plugin-stealth":  "^2.11.2"
+    "@bull-board/api": "^5.10.0",
+    "@bull-board/express": "^5.10.0",
+    "@mendable/firecrawl-js": "*",
+    "@supabase/supabase-js": "^2.39.0",
+    "bullmq": "^5.0.0",
+    "crawlee": "^3.9.0",
+    "dotenv": "^16.4.0",
+    "express": "^4.18.0",
+    "ioredis": "^5.3.0",
+    "playwright-extra": "^4.3.6",
+    "puppeteer": "^22.0.0",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
-    "tsx":         "^4.7.0",
-    "typescript":  "^5.3.0"
+    "tsx": "^4.7.0",
+    "typescript": "^5.3.0"
   }
 }
