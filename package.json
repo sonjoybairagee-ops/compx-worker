@@ -4,9 +4,9 @@
   "description": "CompX Unified Worker — Scraping + Enrichment + Email Verify",
   "type": "module",
   "scripts": {
-    "start":  "node --experimental-vm-modules dist/index.js",
-    "dev":    "npx tsx watch src/index.ts",
-    "worker": "npx tsx src/index.ts",
+    "start":  "npx tsx src/index.js",
+    "dev":    "npx tsx watch src/index.js",
+    "worker": "npx tsx src/index.js",
     "build":  "tsc"
   },
   "dependencies": {
