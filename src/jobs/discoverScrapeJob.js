@@ -1,7 +1,7 @@
 /**
  * CompX — discoverScrapeJob.js
- * SerpAPI (Google Maps) + Firecrawl দিয়ে lead discovery
- * কোনো Google Cloud billing লাগবে না ✅
+ * Playwright সরিয়ে Firecrawl + Google Maps API দিয়ে replace করা হয়েছে
+ * Render Free/Paid সব tier-এ কাজ করবে
  */
 
 import FirecrawlApp from "@mendable/firecrawl-js";
@@ -30,6 +30,7 @@ async function logToTerminal(jobId, message) {
   } catch (e) {}
 }
 
+// Email extract from text
 function extractEmails(text = "") {
   const matches = text.match(
     /([a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+\.[a-zA-Z0-9_-]+)/gi
@@ -40,11 +41,19 @@ function extractEmails(text = "") {
     : [];
 }
 
+// Phone extract and clean
+function cleanPhone(phone) {
+  return phone?.replace(/[^\d+]/g, '').replace(/^880/, '+880') || null;
+}
+
 function extractPhones(text = "") {
-  const matches = text.match(/(\+?[\d\s\-().]{7,20})/g);
+  const matches = text.match(
+    /(\+?[\d\s\-().]{7,20})/g
+  );
   return matches ? [...new Set(matches.map((p) => p.trim()))].slice(0, 3) : [];
 }
 
+// Score calculation
 function calcScore(lead) {
   let score = 30;
   if (lead.website) score += 15;
@@ -56,6 +65,7 @@ function calcScore(lead) {
   return Math.min(99, score);
 }
 
+// Hiring signals
 const HIRING_KEYWORDS = [
   "we're hiring", "we are hiring", "join our team",
   "open positions", "careers", "job openings",
@@ -67,47 +77,52 @@ function detectHiring(text = "") {
   return HIRING_KEYWORDS.some((kw) => lower.includes(kw));
 }
 
-// ── SerpAPI — Google Maps Search ─────────────────────────────────────────────
+// ── Google Maps Search via Places API ────────────────────────────────────────
 async function searchGoogleMaps(keyword, location) {
-  const apiKey = process.env.SERPAPI_KEY;
+  const apiKey = process.env.GOOGLE_MAPS_API_KEY;
 
   if (!apiKey) {
-    console.warn("[DiscoverScrape] No SERPAPI_KEY found in environment");
+    console.warn("[DiscoverScrape] No GOOGLE_MAPS_API_KEY — using mock data");
     return [];
   }
 
   const query = `${keyword} in ${location}`;
-  const url = `https://serpapi.com/search.json?engine=google_maps&q=${encodeURIComponent(query)}&api_key=${apiKey}&type=search`;
+  const url = `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(query)}&key=${apiKey}`;
 
-  try {
-    const res = await fetch(url);
-    const json = await res.json();
+  const res = await fetch(url);
+  const json = await res.json();
 
-    if (json.error) {
-      console.error("[DiscoverScrape] SerpAPI error:", json.error);
-      return [];
-    }
+  if (!json.results) return [];
 
-    const places = json.local_results || [];
+  return json.results.slice(0, 10).map((place) => ({
+    id:       `map_${place.place_id}`,
+    name:     place.name,
+    address:  place.formatted_address,
+    rating:   place.rating?.toString() || "",
+    industry: place.types?.[0]?.replace(/_/g, " ") || "",
+    website:  null, // Places API detail call-এ পাওয়া যাবে
+    phone:    null,
+    email:    null,
+    score:    40,
+    hiring:   false,
+    placeId:  place.place_id,
+  }));
+}
 
-    return places.slice(0, 10).map((place) => ({
-      id:       `map_${place.place_id || place.data_id || Math.random()}`,
-      name:     place.title || "Unknown",
-      address:  place.address || "",
-      rating:   place.rating?.toString() || "",
-      reviews:  place.reviews?.toString() || "",
-      industry: place.type || "",
-      website:  place.website || null,
-      phone:    place.phone || null,
-      email:    null,
-      score:    40,
-      isHiring: false,
-      linkedin: null,
-    }));
-  } catch (err) {
-    console.error("[DiscoverScrape] SerpAPI fetch error:", err.message);
-    return [];
-  }
+// ── Get website from Place Details ───────────────────────────────────────────
+async function getPlaceDetails(placeId) {
+  const apiKey = process.env.GOOGLE_MAPS_API_KEY;
+  if (!apiKey || !placeId) return {};
+
+  const url = `https://maps.googleapis.com/maps/api/place/details/json?place_id=${placeId}&fields=website,formatted_phone_number&key=${apiKey}`;
+
+  const res = await fetch(url);
+  const json = await res.json();
+
+  return {
+    website: json.result?.website || null,
+    phone:   json.result?.formatted_phone_number || null,
+  };
 }
 
 // ── Website Enrichment via Firecrawl ─────────────────────────────────────────
@@ -122,20 +137,21 @@ async function enrichWebsite(website, jobId) {
 
     const content = result?.markdown || "";
 
-    const emails   = extractEmails(content);
-    const phones   = extractPhones(content);
+    const emails  = extractEmails(content);
+    const phones  = extractPhones(content);
     const isHiring = detectHiring(content);
 
+    // Social links
     const linkedin = content.match(/linkedin\.com\/company\/[\w-]+/)?.[0] || null;
     const twitter  = content.match(/twitter\.com\/[\w-]+/)?.[0] || null;
 
     return {
-      email:          emails[0] || null,
-      allEmails:      emails,
-      phone:          phones[0] || null,
+      email:    emails[0] || null,
+      allEmails: emails,
+      phone:    phones[0] || null,
       isHiring,
-      linkedin:       linkedin ? `https://${linkedin}` : null,
-      twitter:        twitter  ? `https://${twitter}`  : null,
+      linkedin: linkedin ? `https://${linkedin}` : null,
+      twitter:  twitter  ? `https://${twitter}`  : null,
       metaDescription: result?.metadata?.description || null,
     };
   } catch (err) {
@@ -149,31 +165,35 @@ export async function runDiscoverScrape(inputData, userId, jobId, proxy) {
   const { keyword, location } = inputData;
 
   await logToTerminal(jobId, `Starting discovery: "${keyword}" in "${location}"`);
-  await logToTerminal(jobId, `Using SerpAPI + Firecrawl (no browser needed)`);
+  await logToTerminal(jobId, `Using Firecrawl (no browser needed)`);
 
-  // ── Step 1: SerpAPI দিয়ে Google Maps থেকে businesses খোঁজো ─────────────
-  await logToTerminal(jobId, `Searching Google Maps via SerpAPI...`);
+  // ── Step 1: Google Maps থেকে businesses খোঁজো ──────────────────────────
+  await logToTerminal(jobId, `Searching Google Maps...`);
   let results = await searchGoogleMaps(keyword, location);
   await logToTerminal(jobId, `Found ${results.length} businesses`);
 
-  if (results.length === 0) {
-    await logToTerminal(jobId, `⚠️ No results found. Check SERPAPI_KEY or try different keyword/location.`);
-    await logToTerminal(jobId, `✅ Job complete — 0 leads saved`);
-    return { count: 0, leads: [] };
+  // ── Step 2: প্রতিটা business-এর website + phone বের করো ────────────────
+  await logToTerminal(jobId, `Fetching place details...`);
+  for (const lead of results) {
+    if (lead.placeId) {
+      const details = await getPlaceDetails(lead.placeId);
+      lead.website = details.website || null;
+      lead.phone   = lead.phone || details.phone || null;
+    }
   }
 
-  // ── Step 2: Website থেকে email + signals বের করো ───────────────────────
+  // ── Step 3: Website থেকে email + signals বের করো ───────────────────────
   await logToTerminal(jobId, `Starting website enrichment phase...`);
 
   for (const lead of results) {
     if (lead.website) {
       const enriched = await enrichWebsite(lead.website, jobId);
-      lead.email           = enriched.email       || lead.email;
-      lead.phone           = enriched.phone       || lead.phone;
-      lead.isHiring        = enriched.isHiring    || false;
-      lead.linkedin        = enriched.linkedin    || null;
-      lead.twitter         = enriched.twitter     || null;
-      lead.allEmails       = enriched.allEmails   || [];
+      lead.email       = enriched.email       || lead.email;
+      lead.phone       = enriched.phone       || lead.phone;
+      lead.isHiring    = enriched.isHiring    || false;
+      lead.linkedin    = enriched.linkedin    || null;
+      lead.twitter     = enriched.twitter     || null;
+      lead.allEmails   = enriched.allEmails   || [];
       lead.metaDescription = enriched.metaDescription || null;
 
       await logToTerminal(
@@ -182,28 +202,29 @@ export async function runDiscoverScrape(inputData, userId, jobId, proxy) {
       );
     }
 
+    // Score calculate করো
     lead.score = calcScore(lead);
   }
 
-  // ── Step 3: Database-এ save করো ─────────────────────────────────────────
+  // ── Step 4: Database-এ save করো ─────────────────────────────────────────
   await logToTerminal(jobId, `Saving ${results.length} leads to database...`);
 
   const leadsToInsert = results.map((lead) => ({
-    org_id:           inputData.orgId,
-    source:           "google maps discover",
-    company:          lead.name,
-    name:             lead.name,
-    phone:            lead.phone    || null,
-    email:            lead.email    || null,
-    website:          lead.website  || null,
-    industry:         lead.industry || null,
-    score:            lead.score,
-    lead_score:       lead.score,
-    address:          lead.address  || null,
-    is_hiring:        lead.isHiring || false,
-    linkedin:         lead.linkedin || null,
+    org_id:    inputData.orgId,
+    source:    "google maps discover",
+    company:   lead.name,
+    name:      lead.name,
+    phone:     cleanPhone(lead.phone),
+    email:     lead.email   || null,
+    website:   lead.website || null,
+    industry:  lead.industry || null,
+    score:     lead.score,
+    lead_score: lead.score,
+    address:   lead.address || null,
+    is_hiring: lead.isHiring || false,
+    linkedin:  lead.linkedin || null,
     meta_description: lead.metaDescription || null,
-    created_at:       new Date().toISOString(),
+    created_at: new Date().toISOString(),
   }));
 
   if (leadsToInsert.length > 0) {
