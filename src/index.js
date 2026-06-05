@@ -12,6 +12,7 @@ import { Worker, Queue } from "bullmq";
 import IORedis from "ioredis";
 import { runEnrichJob }    from "./jobs/enrichJob.js";
 import { runDeepScrape }   from "./jobs/deepScrapeJob.js";
+import { runDiscoverScrape } from "./jobs/discoverScrapeJob.js";
 import { runVerifyEmail }  from "./jobs/verifyEmailJob.js";
 import { runWebhookJob }   from "./jobs/webhookJob.js";
 import { pollSupabaseJobs } from "./poller.js";
@@ -55,7 +56,8 @@ export const jobQueue = new Queue("compx-jobs", { connection: redis });
 
 // ── Job dispatcher ────────────────────────────────────────────────────────────
 async function processJob(job) {
-  const { type, input_data, user_id } = job.data;
+  const { input_data, user_id } = job.data;
+  const type = job.data.type || job.name; // Fallback to job.name if job.data.type is undefined
 
   // ── Routing decision ──────────────────────────────────────
   const routingCtx = {
@@ -88,6 +90,9 @@ async function processJob(job) {
         break;
       case "deep_scrape":
         result = await runDeepScrape(input_data, user_id, proxy);
+        break;
+      case "discover_scrape":
+        result = await runDiscoverScrape(input_data, user_id, job.id, proxy);
         break;
       case "verify_email":
         result = await runVerifyEmail(input_data, user_id);
