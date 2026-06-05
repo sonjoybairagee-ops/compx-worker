@@ -1,162 +1,240 @@
-import { chromium } from "playwright-extra";
-import stealth from "puppeteer-extra-plugin-stealth";
+/**
+ * CompX — discoverScrapeJob.js
+ * Playwright সরিয়ে Firecrawl + Google Maps API দিয়ে replace করা হয়েছে
+ * Render Free/Paid সব tier-এ কাজ করবে
+ */
+
+import FirecrawlApp from "@mendable/firecrawl-js";
 import { supabase } from "../config/supabase.js";
 
-chromium.use(stealth());
+// ── Firecrawl client ──────────────────────────────────────────────────────────
+const firecrawl = new FirecrawlApp({
+  apiKey: process.env.FIRECRAWL_API_KEY,
+});
 
-const humanDelay = (min = 800, max = 2500) =>
-  new Promise(r => setTimeout(r, min + Math.random() * (max - min)));
-
+// ── Helpers ───────────────────────────────────────────────────────────────────
 async function logToTerminal(jobId, message) {
   console.log(`[DiscoverScrape ${jobId}] ${message}`);
-  // Append to job's terminal_logs in Supabase
   try {
-    const { data } = await supabase.from("jobs").select("terminal_logs").eq("id", jobId).single();
+    const { data } = await supabase
+      .from("jobs")
+      .select("terminal_logs")
+      .eq("id", jobId)
+      .single();
     const logs = data?.terminal_logs || [];
     logs.push({ time: new Date().toISOString(), message });
-    await supabase.from("jobs").update({ terminal_logs: logs }).eq("id", jobId);
-  } catch(e) {}
+    await supabase
+      .from("jobs")
+      .update({ terminal_logs: logs })
+      .eq("id", jobId);
+  } catch (e) {}
 }
 
+// Email extract from text
+function extractEmails(text = "") {
+  const matches = text.match(
+    /([a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+\.[a-zA-Z0-9_-]+)/gi
+  );
+  const fakePatterns = /example\.|test\.|noreply\.|placeholder\./i;
+  return matches
+    ? [...new Set(matches)].filter((e) => !fakePatterns.test(e))
+    : [];
+}
+
+// Phone extract from text
+function extractPhones(text = "") {
+  const matches = text.match(
+    /(\+?[\d\s\-().]{7,20})/g
+  );
+  return matches ? [...new Set(matches.map((p) => p.trim()))].slice(0, 3) : [];
+}
+
+// Score calculation
+function calcScore(lead) {
+  let score = 30;
+  if (lead.website) score += 15;
+  if (lead.phone)   score += 15;
+  if (lead.email)   score += 25;
+  if (lead.rating && parseFloat(lead.rating) >= 4.0) score += 10;
+  if (lead.isHiring) score += 20;
+  if (lead.linkedin) score += 10;
+  return Math.min(99, score);
+}
+
+// Hiring signals
+const HIRING_KEYWORDS = [
+  "we're hiring", "we are hiring", "join our team",
+  "open positions", "careers", "job openings",
+  "greenhouse.io", "lever.co", "workable.com", "jobs.ashbyhq.com",
+];
+
+function detectHiring(text = "") {
+  const lower = text.toLowerCase();
+  return HIRING_KEYWORDS.some((kw) => lower.includes(kw));
+}
+
+// ── Google Maps Search via Places API ────────────────────────────────────────
+async function searchGoogleMaps(keyword, location) {
+  const apiKey = process.env.GOOGLE_MAPS_API_KEY;
+
+  if (!apiKey) {
+    console.warn("[DiscoverScrape] No GOOGLE_MAPS_API_KEY — using mock data");
+    return [];
+  }
+
+  const query = `${keyword} in ${location}`;
+  const url = `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(query)}&key=${apiKey}`;
+
+  const res = await fetch(url);
+  const json = await res.json();
+
+  if (!json.results) return [];
+
+  return json.results.slice(0, 10).map((place) => ({
+    id:       `map_${place.place_id}`,
+    name:     place.name,
+    address:  place.formatted_address,
+    rating:   place.rating?.toString() || "",
+    industry: place.types?.[0]?.replace(/_/g, " ") || "",
+    website:  null, // Places API detail call-এ পাওয়া যাবে
+    phone:    null,
+    email:    null,
+    score:    40,
+    hiring:   false,
+    placeId:  place.place_id,
+  }));
+}
+
+// ── Get website from Place Details ───────────────────────────────────────────
+async function getPlaceDetails(placeId) {
+  const apiKey = process.env.GOOGLE_MAPS_API_KEY;
+  if (!apiKey || !placeId) return {};
+
+  const url = `https://maps.googleapis.com/maps/api/place/details/json?place_id=${placeId}&fields=website,formatted_phone_number&key=${apiKey}`;
+
+  const res = await fetch(url);
+  const json = await res.json();
+
+  return {
+    website: json.result?.website || null,
+    phone:   json.result?.formatted_phone_number || null,
+  };
+}
+
+// ── Website Enrichment via Firecrawl ─────────────────────────────────────────
+async function enrichWebsite(website, jobId) {
+  try {
+    await logToTerminal(jobId, `Scraping ${website}...`);
+
+    const result = await firecrawl.scrapeUrl(website, {
+      formats: ["markdown"],
+      timeout: 15000,
+    });
+
+    const content = result?.markdown || "";
+
+    const emails  = extractEmails(content);
+    const phones  = extractPhones(content);
+    const isHiring = detectHiring(content);
+
+    // Social links
+    const linkedin = content.match(/linkedin\.com\/company\/[\w-]+/)?.[0] || null;
+    const twitter  = content.match(/twitter\.com\/[\w-]+/)?.[0] || null;
+
+    return {
+      email:    emails[0] || null,
+      allEmails: emails,
+      phone:    phones[0] || null,
+      isHiring,
+      linkedin: linkedin ? `https://${linkedin}` : null,
+      twitter:  twitter  ? `https://${twitter}`  : null,
+      metaDescription: result?.metadata?.description || null,
+    };
+  } catch (err) {
+    await logToTerminal(jobId, `Enrichment failed for ${website}: ${err.message}`);
+    return {};
+  }
+}
+
+// ── Main Job ──────────────────────────────────────────────────────────────────
 export async function runDiscoverScrape(inputData, userId, jobId, proxy) {
   const { keyword, location } = inputData;
-  const searchUrl = `https://www.google.com/maps/search/${encodeURIComponent(`${keyword} in ${location}`)}`;
 
-  await logToTerminal(jobId, `Starting stealth browser...`);
-  
-  const args = ['--no-sandbox', '--disable-setuid-sandbox'];
-  if (proxy && proxy.url) {
-    args.push(`--proxy-server=${proxy.url}`);
-    await logToTerminal(jobId, `[Proxy] Routed via secure network proxy`);
+  await logToTerminal(jobId, `Starting discovery: "${keyword}" in "${location}"`);
+  await logToTerminal(jobId, `Using Firecrawl (no browser needed)`);
+
+  // ── Step 1: Google Maps থেকে businesses খোঁজো ──────────────────────────
+  await logToTerminal(jobId, `Searching Google Maps...`);
+  let results = await searchGoogleMaps(keyword, location);
+  await logToTerminal(jobId, `Found ${results.length} businesses`);
+
+  // ── Step 2: প্রতিটা business-এর website + phone বের করো ────────────────
+  await logToTerminal(jobId, `Fetching place details...`);
+  for (const lead of results) {
+    if (lead.placeId) {
+      const details = await getPlaceDetails(lead.placeId);
+      lead.website = details.website || null;
+      lead.phone   = lead.phone || details.phone || null;
+    }
   }
 
-  const browser = await chromium.launch({
-    headless: true, // or "new"
-    args: args
-  });
+  // ── Step 3: Website থেকে email + signals বের করো ───────────────────────
+  await logToTerminal(jobId, `Starting website enrichment phase...`);
 
-  const context = await browser.newContext({
-    viewport: { width: 1366, height: 768 },
-    userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-  });
+  for (const lead of results) {
+    if (lead.website) {
+      const enriched = await enrichWebsite(lead.website, jobId);
+      lead.email       = enriched.email       || lead.email;
+      lead.phone       = enriched.phone       || lead.phone;
+      lead.isHiring    = enriched.isHiring    || false;
+      lead.linkedin    = enriched.linkedin    || null;
+      lead.twitter     = enriched.twitter     || null;
+      lead.allEmails   = enriched.allEmails   || [];
+      lead.metaDescription = enriched.metaDescription || null;
 
-  const page = await context.newPage();
-  
-  let results = [];
-
-  try {
-    await logToTerminal(jobId, `Navigating to Google Maps for "${keyword} in ${location}"...`);
-    await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await humanDelay(2000, 3000);
-
-    // Handle initial Captcha or Consent if any
-    const isCaptcha = await page.$('form[action*="Captcha"]');
-    if (isCaptcha) {
-      await logToTerminal(jobId, `[WARNING] CAPTCHA detected. Attempting to bypass or wait...`);
-      await humanDelay(5000, 8000);
+      await logToTerminal(
+        jobId,
+        `✓ ${lead.name} — email: ${lead.email || "none"}, hiring: ${lead.isHiring}`
+      );
     }
 
-    await logToTerminal(jobId, `Extracting business listings (Scrolling feed)...`);
-
-    // Wait for the feed
-    try {
-      await page.waitForSelector('div[role="feed"]', { timeout: 10000 });
-      for (let i = 0; i < 4; i++) {
-        await page.evaluate(() => {
-          const feed = document.querySelector('div[role="feed"]');
-          if (feed) feed.scrollBy(0, 1000);
-        });
-        await humanDelay(1000, 1500);
-      }
-    } catch(e) {
-      await logToTerminal(jobId, `[WARNING] Feed not found, might be a direct result or slow load.`);
-    }
-
-    const cards = await page.$$('a[href*="/maps/place/"]');
-    await logToTerminal(jobId, `Found ${cards.length} potential businesses. Starting extraction...`);
-
-    const maxCards = Math.min(cards.length, 10); // Extract up to 10 for demo/speed
-
-    for (let i = 0; i < maxCards; i++) {
-      try {
-        await cards[i].click();
-        await humanDelay(1500, 2500);
-
-        const data = await page.evaluate(() => {
-          const getText = sel => document.querySelector(sel)?.innerText?.trim() || "";
-          const getAttr = (sel, attr) => document.querySelector(sel)?.getAttribute(attr) || "";
-
-          return {
-            name:     getText("h1.DUwDvf") || getText("h1"),
-            phone:    getAttr('button[data-item-id^="phone:tel:"]', "data-item-id")?.replace("phone:tel:", "") || getText(".phone"),
-            address:  getText('button[data-item-id="address"]'),
-            website:  getAttr('a[data-item-id="authority"]', "href"),
-            rating:   getText(".F7nice span"),
-            industry: getText(".DkEaL"),
-          };
-        });
-
-        if (data.name) {
-          data.id = `map_${Date.now()}_${i}`;
-          data.score = 40; // Initial score, updated later
-          data.hiring = false;
-          results.push(data);
-          await logToTerminal(jobId, `Extracted: ${data.name}`);
-        }
-      } catch(e) {
-        // skip if card errors
-      }
-    }
-
-    // ENRICHMENT PHASE (Job Chaining logic)
-    await logToTerminal(jobId, `Starting Website Enrichment Phase...`);
-    for (const lead of results) {
-      if (lead.website) {
-        await logToTerminal(jobId, `Visiting ${lead.website} for contact enrichment...`);
-        try {
-          const enrichPage = await context.newPage();
-          // Timeout fast so we don't hang
-          await enrichPage.goto(lead.website, { waitUntil: 'domcontentloaded', timeout: 15000 });
-          
-          // Basic email regex scraper
-          const emails = await enrichPage.evaluate(() => {
-            const text = document.body.innerText;
-            const match = text.match(/([a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+\.[a-zA-Z0-9_-]+)/gi);
-            return match ? [...new Set(match)] : [];
-          });
-
-          if (emails.length > 0) {
-            lead.email = emails[0];
-            await logToTerminal(jobId, `Found contact email for ${lead.name}: ${lead.email}`);
-          } else {
-            await logToTerminal(jobId, `No email found on homepage for ${lead.name}`);
-          }
-          await enrichPage.close();
-        } catch(err) {
-          await logToTerminal(jobId, `Failed to enrich ${lead.website}: ${err.message}`);
-        }
-      }
-
-      let finalScore = 40;
-      if (lead.website) finalScore += 20;
-      if (lead.phone) finalScore += 15;
-      if (lead.email) finalScore += 25;
-      if (lead.rating && parseFloat(lead.rating) >= 4.0) finalScore += 10;
-      lead.score = Math.min(99, finalScore);
-    }
-
-    await logToTerminal(jobId, `Saving ${results.length} enriched leads to database...`);
-    
-    // In a real app we'd save to extension_database here too if wanted, 
-    // but for discover search, returning them in output_data of the job is enough to show on frontend.
-    
-  } catch (error) {
-    await logToTerminal(jobId, `[ERROR] ${error.message}`);
-    throw error;
-  } finally {
-    await browser.close();
-    await logToTerminal(jobId, `Job Complete.`);
+    // Score calculate করো
+    lead.score = calcScore(lead);
   }
 
-  return { count: results.length, leads: results };
+  // ── Step 4: Database-এ save করো ─────────────────────────────────────────
+  await logToTerminal(jobId, `Saving ${results.length} leads to database...`);
+
+  const leadsToInsert = results.map((lead) => ({
+    org_id:    inputData.orgId,
+    source:    "google maps discover",
+    company:   lead.name,
+    name:      lead.name,
+    phone:     lead.phone   || null,
+    email:     lead.email   || null,
+    website:   lead.website || null,
+    industry:  lead.industry || null,
+    score:     lead.score,
+    lead_score: lead.score,
+    address:   lead.address || null,
+    is_hiring: lead.isHiring || false,
+    linkedin:  lead.linkedin || null,
+    meta_description: lead.metaDescription || null,
+    created_at: new Date().toISOString(),
+  }));
+
+  if (leadsToInsert.length > 0) {
+    const { error } = await supabase.from("leads").insert(leadsToInsert);
+    if (error) {
+      await logToTerminal(jobId, `[ERROR] DB save failed: ${error.message}`);
+      throw error;
+    }
+  }
+
+  await logToTerminal(jobId, `✅ Job complete — ${results.length} leads saved`);
+
+  return {
+    count: results.length,
+    leads: results,
+  };
 }
