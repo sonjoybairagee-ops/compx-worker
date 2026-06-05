@@ -63,7 +63,7 @@ export function getBestProxy(routing?: Partial<RoutingDecision>): any | null {
 
   // minScore filter
   if (routing?.minScore !== undefined) {
-    const filtered = scoredPool.filter(p => p.score >= routing.minScore);
+    const filtered = scoredPool.filter(p => p.score >= routing.minScore!);
     if (filtered.length) scoredPool = filtered;
   }
 

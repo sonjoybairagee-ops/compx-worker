@@ -1,31 +1,63 @@
 /**
  * CompX Worker — src/jobs/deepScrapeJob.js
- * Deep scrape using Puppeteer with anti-bot techniques + proxy support
+ * Unified scraper: Google Maps, Yellow Pages, LinkedIn, Yelp,
+ * Facebook Business, Amazon Seller, Clutch, G2, Instagram
  *
- * PhantomBuster method:
- * 1. Stealth mode (no webdriver fingerprint)
- * 2. Human-like delays + mouse movement
- * 3. Random viewport + user agent
- * 4. Proxy injection
- * 5. Pagination handling
+ * Singleton browser — একটাই browser instance সব job share করে
  */
 
 import puppeteer from "puppeteer";
 import { supabase } from "../config/supabase.js";
 
-// ── Anti-bot: random human delay ─────────────────────────────────────────────
+// ── Singleton Browser ─────────────────────────────────────────────────────────
+let _browser = null;
+let _browserUseCount = 0;
+const BROWSER_RECYCLE_AFTER = 50; // ৫০ job পর browser restart
+
+async function getBrowser(proxyUrl) {
+  if (_browser && _browserUseCount < BROWSER_RECYCLE_AFTER) {
+    try {
+      // Still alive?
+      await _browser.pages();
+      _browserUseCount++;
+      return _browser;
+    } catch {
+      _browser = null;
+    }
+  }
+
+  // Launch new browser
+  if (_browser) {
+    try { await _browser.close(); } catch {}
+  }
+
+  const args = [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-blink-features=AutomationControlled",
+    "--disable-web-security",
+    "--disable-features=IsolateOrigins,site-per-process",
+    "--window-size=1366,768",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+  ];
+
+  if (proxyUrl) args.push(`--proxy-server=${proxyUrl}`);
+
+  _browser = await puppeteer.launch({
+    headless: "new",
+    args,
+    defaultViewport: null,
+  });
+
+  _browserUseCount = 1;
+  console.log("[Browser] New browser instance launched");
+  return _browser;
+}
+
+// ── Anti-bot helpers ──────────────────────────────────────────────────────────
 const humanDelay = (min = 800, max = 2500) =>
   new Promise(r => setTimeout(r, min + Math.random() * (max - min)));
-
-// ── Stealth config ────────────────────────────────────────────────────────────
-const STEALTH_ARGS = [
-  "--no-sandbox",
-  "--disable-setuid-sandbox",
-  "--disable-blink-features=AutomationControlled",
-  "--disable-web-security",
-  "--disable-features=IsolateOrigins,site-per-process",
-  "--window-size=1366,768",
-];
 
 const USER_AGENTS = [
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -33,25 +65,9 @@ const USER_AGENTS = [
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
 ];
 
-function randomUA() {
-  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
-}
-
-// ── Build launch args with optional proxy ─────────────────────────────────────
-function buildLaunchArgs(proxyUrl) {
-  const args = [...STEALTH_ARGS];
-  if (proxyUrl) {
-    args.push(`--proxy-server=${proxyUrl}`);
-    console.log(`[DeepScrape] Using proxy: ${proxyUrl}`);
-  }
-  return args;
-}
-
-// ── Stealth page setup ────────────────────────────────────────────────────────
-async function setupStealthPage(browser) {
+async function newStealthPage(browser) {
   const page = await browser.newPage();
 
-  // Remove webdriver fingerprint
   await page.evaluateOnNewDocument(() => {
     Object.defineProperty(navigator, "webdriver", { get: () => false });
     Object.defineProperty(navigator, "plugins",   { get: () => [1, 2, 3] });
@@ -59,184 +75,300 @@ async function setupStealthPage(browser) {
     window.chrome = { runtime: {} };
   });
 
-  await page.setUserAgent(randomUA());
+  await page.setUserAgent(USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)]);
   await page.setViewport({
     width:  1366 + Math.floor(Math.random() * 100),
     height: 768  + Math.floor(Math.random() * 50),
   });
 
-  // Block ads + tracking — faster load
   await page.setRequestInterception(true);
   page.on("request", req => {
-    const url  = req.url();
     const type = req.resourceType();
-    if (type === "image" || type === "font" || type === "media") { req.abort(); return; }
-    if (
-      url.includes("doubleclick") ||
-      url.includes("googlesyndication") ||
-      url.includes("analytics")
-    ) { req.abort(); return; }
+    const url  = req.url();
+    if (["image", "font", "media"].includes(type)) return req.abort();
+    if (url.includes("doubleclick") || url.includes("googlesyndication")) return req.abort();
     req.continue();
   });
 
   return page;
 }
 
-// ── Platform-specific deep scrapers ──────────────────────────────────────────
+// ── Platform Scrapers ─────────────────────────────────────────────────────────
 
-async function deepScrapeGoogleMaps(page, inputData) {
-  const { url, category, location } = inputData;
-  const searchUrl = url || `https://www.google.com/maps/search/${encodeURIComponent(`${category || "business"} ${location || ""}`)}`;
+async function scrapeGoogleMaps(page, inputData) {
+  const { keyword, location, maxResults = 20 } = inputData;
+  const searchUrl = `https://www.google.com/maps/search/${encodeURIComponent(`${keyword} ${location || ""}`)}`;
 
   await page.goto(searchUrl, { waitUntil: "networkidle2", timeout: 30000 });
   await humanDelay(2000, 4000);
 
-  const results = [];
-
-  // Scroll to load more results
   const feed = await page.$('div[role="feed"]');
   if (feed) {
     for (let i = 0; i < 5; i++) {
       await page.evaluate(el => el.scrollBy(0, 500), feed);
-      await humanDelay(1200, 2000);
+      await humanDelay(1000, 1800);
     }
   }
 
-  // Extract business cards
   const cards = await page.$$('a[href*="/maps/place/"]');
-  console.log(`[DeepScrape Maps] Found ${cards.length} cards`);
+  console.log(`[GoogleMaps] Found ${cards.length} cards`);
 
-  for (const card of cards.slice(0, 20)) {
+  const results = [];
+  for (const card of cards.slice(0, maxResults)) {
     try {
       await card.click();
       await humanDelay(1500, 2500);
-
       const data = await page.evaluate(() => {
-        const getText = sel => document.querySelector(sel)?.innerText?.trim() || "";
-        const getAttr = (sel, attr) => document.querySelector(sel)?.getAttribute(attr) || "";
-
+        const get  = sel => document.querySelector(sel)?.innerText?.trim() || "";
+        const attr = (sel, a) => document.querySelector(sel)?.getAttribute(a) || "";
         return {
-          name:     getText("h1.DUwDvf") || getText("h1"),
-          phone:    getAttr('button[data-item-id^="phone:tel:"]', "data-item-id")?.replace("phone:tel:", "") || getText(".phone"),
-          address:  getText('button[data-item-id="address"]'),
-          website:  getAttr('a[data-item-id="authority"]', "href"),
-          rating:   getText(".F7nice span"),
-          category: getText(".DkEaL"),
+          company_name: get("h1.DUwDvf") || get("h1"),
+          phone:    attr('[data-item-id^="phone:tel:"]', "data-item-id")?.replace("phone:tel:", "") || "",
+          address:  get('[data-item-id="address"]'),
+          website:  attr('[data-item-id="authority"]', "href"),
+          rating:   get(".F7nice span"),
+          category: get(".DkEaL"),
         };
       });
-
-      if (data.name && data.name !== "Results") results.push(data);
+      if (data.company_name && data.company_name !== "Results") results.push(data);
     } catch {}
   }
-
   return results;
 }
 
-async function deepScrapeYellowPages(page, inputData) {
-  const { url } = inputData;
-  if (!url) return [];
+async function scrapeYellowPages(page, inputData) {
+  const { keyword, location, url } = inputData;
+  const targetUrl = url || `https://www.yellowpages.com/search?search_terms=${encodeURIComponent(keyword)}&geo_location_terms=${encodeURIComponent(location || "")}`;
 
-  await page.goto(url, { waitUntil: "networkidle2", timeout: 30000 });
+  await page.goto(targetUrl, { waitUntil: "networkidle2", timeout: 30000 });
   await humanDelay(1500, 3000);
 
-  // Scroll for lazy-load
   for (let i = 0; i < 3; i++) {
     await page.evaluate(() => window.scrollBy(0, 800));
     await humanDelay(800, 1200);
   }
 
-  const results = await page.evaluate(() => {
-    return [...document.querySelectorAll(".result, .organic .srp-listing")].map(card => {
-      const name    = card.querySelector(".business-name span")?.innerText?.trim() || "";
-      const phone   = card.querySelector(".phone, [itemprop='telephone']")?.innerText?.trim() || "";
-      const address = [
+  return page.evaluate(() =>
+    [...document.querySelectorAll(".result, .organic .srp-listing")].map(card => ({
+      company_name: card.querySelector(".business-name span")?.innerText?.trim() || "",
+      phone:    card.querySelector(".phone, [itemprop='telephone']")?.innerText?.trim() || "",
+      address:  [
         card.querySelector(".street-address")?.innerText?.trim(),
-        card.querySelector(".locality, .city")?.innerText?.trim(),
-        card.querySelector(".region, .state")?.innerText?.trim(),
-      ].filter(Boolean).join(", ");
-      const category  = card.querySelector(".categories a")?.innerText?.trim() || "";
-      const websiteEl = card.querySelector("a.track-visit-website");
-      let website = "";
-      if (websiteEl) {
-        const href = websiteEl.getAttribute("href") || "";
-        if (href.includes("aclk")) {
-          try {
-            const u = new URL(href.startsWith("http") ? href : `https://www.yellowpages.com${href}`);
-            website = u.searchParams.get("redirect") || u.searchParams.get("url") || "";
-          } catch {}
-        } else { website = href; }
-      }
-      const ratingCls = card.querySelector("[class*='rating']")?.className || "";
-      const rm        = ratingCls.match(/rated?-(\d)/i);
-      const rating    = rm ? rm[1] : "";
-
-      return { name, phone, address, category, website, rating };
-    }).filter(r => r.name);
-  });
-
-  return results;
+        card.querySelector(".locality")?.innerText?.trim(),
+        card.querySelector(".region")?.innerText?.trim(),
+      ].filter(Boolean).join(", "),
+      category: card.querySelector(".categories a")?.innerText?.trim() || "",
+      website:  card.querySelector("a.track-visit-website")?.href || "",
+    })).filter(r => r.company_name)
+  );
 }
 
-// ── Main deep scrape job ──────────────────────────────────────────────────────
+async function scrapeYelp(page, inputData) {
+  const { keyword, location, maxResults = 20 } = inputData;
+  const url = `https://www.yelp.com/search?find_desc=${encodeURIComponent(keyword)}&find_loc=${encodeURIComponent(location || "")}`;
+
+  await page.goto(url, { waitUntil: "networkidle2", timeout: 30000 });
+  await humanDelay(2000, 3500);
+
+  return page.evaluate((max) =>
+    [...document.querySelectorAll('[data-testid="serp-ia-card"], .businessName__09f24__EYSZE, h3.css-1agk4wl')].slice(0, max).map(el => {
+      const card = el.closest('[data-testid="serp-ia-card"]') || el.parentElement?.parentElement;
+      return {
+        company_name: el.querySelector("a")?.innerText?.trim() || el.innerText?.trim() || "",
+        rating:   card?.querySelector('[aria-label*="star rating"]')?.getAttribute("aria-label")?.match(/[\d.]+/)?.[0] || "",
+        address:  card?.querySelector("address, [class*='secondaryAddress']")?.innerText?.trim() || "",
+        category: card?.querySelector('[class*="tag"], [class*="category"]')?.innerText?.trim() || "",
+      };
+    }).filter(r => r.company_name)
+  , maxResults);
+}
+
+async function scrapeLinkedIn(page, inputData) {
+  const { keyword, location, maxResults = 20 } = inputData;
+  const url = `https://www.linkedin.com/search/results/companies/?keywords=${encodeURIComponent(keyword)}&origin=GLOBAL_SEARCH_HEADER`;
+
+  await page.goto(url, { waitUntil: "networkidle2", timeout: 30000 });
+  await humanDelay(3000, 5000);
+
+  return page.evaluate((max) =>
+    [...document.querySelectorAll(".entity-result__item, .search-results__result-item")].slice(0, max).map(el => ({
+      company_name: el.querySelector(".entity-result__title-text a, .app-aware-link")?.innerText?.trim() || "",
+      industry:  el.querySelector(".entity-result__primary-subtitle")?.innerText?.trim() || "",
+      size:      el.querySelector(".entity-result__secondary-subtitle")?.innerText?.trim() || "",
+      linkedin_url: el.querySelector("a.app-aware-link")?.href || "",
+    })).filter(r => r.company_name)
+  , maxResults);
+}
+
+async function scrapeFacebookBusiness(page, inputData) {
+  const { keyword, location, maxResults = 20 } = inputData;
+  const url = `https://www.facebook.com/search/pages/?q=${encodeURIComponent(`${keyword} ${location || ""}`)}`;
+
+  await page.goto(url, { waitUntil: "networkidle2", timeout: 30000 });
+  await humanDelay(3000, 5000);
+
+  return page.evaluate((max) =>
+    [...document.querySelectorAll('[data-testid="results"], div[role="feed"] > div')].slice(0, max).map(el => ({
+      company_name: el.querySelector("span, a")?.innerText?.trim() || "",
+      category:  el.querySelectorAll("span")?.[1]?.innerText?.trim() || "",
+    })).filter(r => r.company_name && r.company_name.length > 2)
+  , maxResults);
+}
+
+async function scrapeAmazonSeller(page, inputData) {
+  const { keyword, maxResults = 20 } = inputData;
+  const url = `https://www.amazon.com/s?k=${encodeURIComponent(keyword)}&i=merchant-items`;
+
+  await page.goto(url, { waitUntil: "networkidle2", timeout: 30000 });
+  await humanDelay(2000, 3500);
+
+  return page.evaluate((max) =>
+    [...document.querySelectorAll(".s-result-item[data-asin]")].slice(0, max).map(el => ({
+      company_name: el.querySelector(".a-profile-name, .s-line-clamp-1")?.innerText?.trim()
+        || el.querySelector(".a-size-small.a-color-secondary")?.innerText?.trim() || "",
+      asin:    el.getAttribute("data-asin") || "",
+      rating:  el.querySelector(".a-icon-alt")?.innerText?.match(/[\d.]+/)?.[0] || "",
+      price:   el.querySelector(".a-price .a-offscreen")?.innerText?.trim() || "",
+    })).filter(r => r.company_name)
+  , maxResults);
+}
+
+async function scrapeClutch(page, inputData) {
+  const { keyword, maxResults = 20 } = inputData;
+  const url = `https://clutch.co/agencies/${encodeURIComponent(keyword.toLowerCase().replace(/\s+/g, "-"))}`;
+
+  await page.goto(url, { waitUntil: "networkidle2", timeout: 30000 });
+  await humanDelay(2000, 3500);
+
+  return page.evaluate((max) =>
+    [...document.querySelectorAll(".provider-row, .provider__inner")].slice(0, max).map(el => ({
+      company_name: el.querySelector(".company_info h3, .company-name")?.innerText?.trim() || "",
+      website:   el.querySelector("a.website-link, a[href^='http']")?.href || "",
+      rating:    el.querySelector(".sg-rating__number")?.innerText?.trim() || "",
+      reviews:   el.querySelector(".total-reviews")?.innerText?.trim() || "",
+      location:  el.querySelector(".locality")?.innerText?.trim() || "",
+    })).filter(r => r.company_name)
+  , maxResults);
+}
+
+async function scrapeG2(page, inputData) {
+  const { keyword, maxResults = 20 } = inputData;
+  const url = `https://www.g2.com/search?query=${encodeURIComponent(keyword)}`;
+
+  await page.goto(url, { waitUntil: "networkidle2", timeout: 30000 });
+  await humanDelay(2000, 3500);
+
+  return page.evaluate((max) =>
+    [...document.querySelectorAll(".product-listing, [data-analytics-event-name='product-card']")].slice(0, max).map(el => ({
+      company_name: el.querySelector("h3, .product-name")?.innerText?.trim() || "",
+      rating:    el.querySelector(".fw-semibold")?.innerText?.trim() || "",
+      reviews:   el.querySelector(".reviews-count")?.innerText?.trim() || "",
+      category:  el.querySelector(".product-category")?.innerText?.trim() || "",
+    })).filter(r => r.company_name)
+  , maxResults);
+}
+
+async function scrapeInstagramBusiness(page, inputData) {
+  const { keyword, maxResults = 20 } = inputData;
+  const url = `https://www.instagram.com/explore/tags/${encodeURIComponent(keyword.replace(/\s+/g, ""))}`;
+
+  await page.goto(url, { waitUntil: "networkidle2", timeout: 30000 });
+  await humanDelay(3000, 5000);
+
+  return page.evaluate((max) =>
+    [...document.querySelectorAll("article a, ._aagw")].slice(0, max).map(el => ({
+      company_name: el.querySelector("img")?.alt?.split("photo")[0]?.trim() || "",
+      instagram_url: el.href || el.querySelector("a")?.href || "",
+    })).filter(r => r.company_name)
+  , maxResults);
+}
+
+// ── Main Entry ────────────────────────────────────────────────────────────────
 export async function runDeepScrape(inputData, userId) {
-  const { source, url, leadId, name, proxyUrl } = inputData;
+  const source = (inputData?.source || "google_maps").toLowerCase().replace(/-/g, "_");
+  const { proxyUrl } = inputData;
 
-  console.log(`[DeepScrape] Starting: ${source} — ${name || url} ${proxyUrl ? "(proxy: " + proxyUrl + ")" : "(no proxy)"}`);
+  console.log(`[DeepScrape] ▶ source="${source}" user=${userId}`);
 
-  const browser = await puppeteer.launch({
-    headless:        "new",
-    args:            buildLaunchArgs(proxyUrl),  // ← proxy injected here
-    defaultViewport: null,
-  });
-
-  let results = [];
+  const browser = await getBrowser(proxyUrl);
+  const page    = await newStealthPage(browser);
+  let results   = [];
 
   try {
-    const page = await setupStealthPage(browser);
-
-    switch (source?.toLowerCase()) {
-      case "google maps":
+    switch (source) {
       case "google_maps":
-        results = await deepScrapeGoogleMaps(page, inputData);
-        break;
+      case "google-maps-scrape":
+      case "discover_scrape":
+      case "scrape":
+        results = await scrapeGoogleMaps(page, inputData); break;
 
-      case "yellow pages":
       case "yellow_pages":
-        results = await deepScrapeYellowPages(page, inputData);
-        break;
+      case "yellow-pages-scrape":
+        results = await scrapeYellowPages(page, inputData); break;
+
+      case "yelp":
+      case "yelp-scrape":
+        results = await scrapeYelp(page, inputData); break;
+
+      case "linkedin":
+      case "linkedin-scrape":
+        results = await scrapeLinkedIn(page, inputData); break;
+
+      case "facebook_biz":
+      case "facebook-biz-scrape":
+        results = await scrapeFacebookBusiness(page, inputData); break;
+
+      case "amazon_seller":
+      case "amazon-seller-scrape":
+        results = await scrapeAmazonSeller(page, inputData); break;
+
+      case "clutch":
+      case "clutch-scrape":
+        results = await scrapeClutch(page, inputData); break;
+
+      case "g2":
+      case "g2-scrape":
+        results = await scrapeG2(page, inputData); break;
+
+      case "instagram_biz":
+      case "instagram-biz-scrape":
+        results = await scrapeInstagramBusiness(page, inputData); break;
 
       default:
-        console.warn(`[DeepScrape] No handler for source: ${source}`);
-        break;
+        console.warn(`[DeepScrape] No handler for source: "${source}"`);
     }
 
-    console.log(`[DeepScrape] Done: ${results.length} results`);
+    console.log(`[DeepScrape] ✅ Done — ${results.length} results`);
 
-    // Store results to Supabase
+    // Store to Supabase
     if (results.length > 0 && userId) {
-      const rows = results.map(r => ({
-        user_id:      userId,
-        source:       source,
-        company_name: r.name    || "Unknown",
-        phone:        r.phone   || null,
-        address:      r.address || null,
-        website:      r.website || null,
-        category:     r.category || null,
-        rating:       r.rating ? parseFloat(r.rating) : null,
-        scraped_at:   new Date().toISOString(),
-      }));
+      const rows = results
+        .filter(r => r.company_name)
+        .map(r => ({
+          user_id:      userId,
+          source,
+          company_name: r.company_name || "Unknown",
+          phone:        r.phone   || null,
+          address:      r.address || null,
+          website:      r.website || null,
+          category:     r.category || null,
+          rating:       r.rating  ? parseFloat(r.rating) : null,
+          linkedin_url: r.linkedin_url || null,
+          scraped_at:   Date.now(),
+          created_at:   new Date().toISOString(),
+        }));
 
-      const { error } = await supabase
-        .from("extension_database")
-        .upsert(rows, { onConflict: "hash" });
-
-      if (error) console.error("[DeepScrape] Supabase error:", error.message);
-      else       console.log(`[DeepScrape] Stored ${rows.length} leads`);
+      if (rows.length > 0) {
+        const { error } = await supabase
+          .from("extension_database")
+          .upsert(rows, { onConflict: "hash", ignoreDuplicates: true });
+        if (error) console.error("[DeepScrape] Supabase error:", error.message);
+        else console.log(`[DeepScrape] Stored ${rows.length} leads`);
+      }
     }
-
   } finally {
-    await browser.close();
+    await page.close().catch(() => {});
   }
 
-  return { count: results.length, results };
+  return { count: results.length, results, source };
 }
