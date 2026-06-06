@@ -1,6 +1,6 @@
 /**
  * CompX — discoverScrapeJob.js
- * Google Maps API (primary) + SerpAPI (fallback) + Firecrawl + Apollo
+ * Google Maps API (primary) + SerpAPI (fallback) + Firecrawl multi-page + Apollo
  */
 
 import FirecrawlApp from "@mendable/firecrawl-js";
@@ -22,7 +22,7 @@ async function logToTerminal(jobId, message) {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function extractEmails(text = "") {
   const matches = text.match(/([a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+\.[a-zA-Z0-9_-]+)/gi);
-  const fake = /example\.|test\.|noreply\.|placeholder\.|@sentry\.|@2x\./i;
+  const fake = /example\.|test\.|noreply\.|placeholder\.|@sentry\.|@2x\.|\.png|\.jpg|\.gif|\.svg/i;
   return matches ? [...new Set(matches)].filter(e => !fake.test(e)) : [];
 }
 
@@ -52,28 +52,30 @@ function calcScore(lead) {
   return Math.min(99, score);
 }
 
+// Social media URL হলে scrape skip করো
+function isScrapable(url = "") {
+  const blocked = ["facebook.com", "instagram.com", "twitter.com", "linkedin.com", "youtube.com", "tiktok.com"];
+  return !blocked.some(b => url.includes(b));
+}
+
 // ── Google Maps API (Primary) ─────────────────────────────────────────────────
 async function searchWithGoogleMaps(keyword, location, maxResults = 10) {
   const apiKey = process.env.GOOGLE_MAPS_API_KEY;
-  if (!apiKey) return null; // null = try fallback
+  if (!apiKey) return null;
 
   try {
     const query = location ? `${keyword} in ${location}` : keyword;
     const url = `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(query)}&key=${apiKey}`;
-
     const res  = await fetch(url);
     const json = await res.json();
 
     if (json.status === "REQUEST_DENIED" || json.status === "OVER_QUERY_LIMIT") {
-      console.warn(`[DiscoverScrape] Google Maps status: ${json.status} — switching to SerpAPI`);
-      return null; // fallback
+      console.warn(`[DiscoverScrape] Google Maps: ${json.status} — switching to SerpAPI`);
+      return null;
     }
 
     if (!json.results || json.results.length === 0) return null;
 
-    console.log(`[DiscoverScrape] Google Maps found ${json.results.length} results`);
-
-    // Place details (website + phone)
     const results = json.results.slice(0, maxResults).map(place => ({
       id:       `map_${place.place_id}`,
       name:     place.name,
@@ -86,7 +88,6 @@ async function searchWithGoogleMaps(keyword, location, maxResults = 10) {
       placeId:  place.place_id,
     }));
 
-    // Place details থেকে website + phone নাও
     for (const lead of results) {
       if (lead.placeId) {
         const detailUrl = `https://maps.googleapis.com/maps/api/place/details/json?place_id=${lead.placeId}&fields=website,formatted_phone_number&key=${apiKey}`;
@@ -100,19 +101,19 @@ async function searchWithGoogleMaps(keyword, location, maxResults = 10) {
     return results;
   } catch (err) {
     console.error("[DiscoverScrape] Google Maps error:", err.message);
-    return null; // fallback
+    return null;
   }
 }
 
 // ── SerpAPI (Fallback) ────────────────────────────────────────────────────────
 async function searchWithSerpAPI(keyword, location, maxResults = 10) {
-  const apiKey = process.env.SERPAPI_API_KEY;
+  // SERPAPI_KEY বা SERPAPI_API_KEY দুটোই check করো
+  const apiKey = process.env.SERPAPI_KEY || process.env.SERPAPI_API_KEY;
   if (!apiKey) return [];
 
   try {
     const query = location ? `${keyword} in ${location}` : keyword;
     const url = `https://serpapi.com/search.json?engine=google_maps&q=${encodeURIComponent(query)}&api_key=${apiKey}&num=${maxResults}`;
-
     const res  = await fetch(url);
     const json = await res.json();
 
@@ -122,8 +123,6 @@ async function searchWithSerpAPI(keyword, location, maxResults = 10) {
     }
 
     const places = json.local_results || [];
-    console.log(`[DiscoverScrape] SerpAPI found ${places.length} results`);
-
     return places.slice(0, maxResults).map(place => ({
       id:       `serp_${place.place_id || Math.random()}`,
       name:     place.title   || "",
@@ -135,16 +134,14 @@ async function searchWithSerpAPI(keyword, location, maxResults = 10) {
       email:    null,
       placeId:  null,
     })).filter(r => r.name);
-
   } catch (err) {
     console.error("[DiscoverScrape] SerpAPI error:", err.message);
     return [];
   }
 }
 
-// ── Smart Search — Google Maps first, SerpAPI fallback ───────────────────────
+// ── Smart Search ──────────────────────────────────────────────────────────────
 async function searchBusinesses(keyword, location, maxResults, jobId) {
-  // Google Maps API try করো
   await logToTerminal(jobId, `Trying Google Maps API...`);
   const googleResults = await searchWithGoogleMaps(keyword, location, maxResults);
 
@@ -153,7 +150,6 @@ async function searchBusinesses(keyword, location, maxResults, jobId) {
     return googleResults;
   }
 
-  // Fallback: SerpAPI
   await logToTerminal(jobId, `Google Maps failed — switching to SerpAPI...`);
   const serpResults = await searchWithSerpAPI(keyword, location, maxResults);
   await logToTerminal(jobId, `SerpAPI: ${serpResults.length} results`);
@@ -167,13 +163,9 @@ async function getEmailFromApollo(companyName, domain, jobId) {
 
   try {
     await logToTerminal(jobId, `Apollo lookup: ${companyName}`);
-
     const searchRes = await fetch("https://api.apollo.io/v1/mixed_people/search", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Api-Key": apiKey,
-      },
+      headers: { "Content-Type": "application/json", "X-Api-Key": apiKey },
       body: JSON.stringify({
         organization_name: companyName,
         person_titles: ["owner", "founder", "ceo", "director", "manager"],
@@ -196,7 +188,6 @@ async function getEmailFromApollo(companyName, domain, jobId) {
         };
       }
     }
-
     return null;
   } catch (err) {
     await logToTerminal(jobId, `Apollo error: ${err.message}`);
@@ -204,24 +195,65 @@ async function getEmailFromApollo(companyName, domain, jobId) {
   }
 }
 
-// ── Firecrawl Website Enrichment ──────────────────────────────────────────────
+// ── Firecrawl Single Page Scrape ──────────────────────────────────────────────
+async function scrapeSinglePage(url) {
+  try {
+    const result = await firecrawl.scrapeUrl(url, { formats: ["markdown"], timeout: 12000 });
+    return result?.markdown || "";
+  } catch {
+    return "";
+  }
+}
+
+// ── Firecrawl Multi-page Enrichment ──────────────────────────────────────────
+// Homepage → /contact → /contact-us → /about → /about-us → stop যখন email পাবে
 async function enrichWebsite(website, jobId) {
   try {
-    await logToTerminal(jobId, `Scraping ${website}...`);
-    const result  = await firecrawl.scrapeUrl(website, { formats: ["markdown"], timeout: 15000 });
-    const content = result?.markdown || "";
-    const emails  = extractEmails(content);
-    const linkedin = content.match(/linkedin\.com\/company\/[\w-]+/)?.[0] || null;
-    const twitter  = content.match(/twitter\.com\/[\w-]+/)?.[0] || null;
+    if (!isScrapable(website)) {
+      await logToTerminal(jobId, `⏭ Skipping social URL: ${website}`);
+      return {};
+    }
+
+    const base = website.replace(/\/$/, "").replace(/^http:\/\//, "https://");
+
+    const pages = [
+      base,
+      `${base}/contact`,
+      `${base}/contact-us`,
+      `${base}/about`,
+      `${base}/about-us`,
+      `${base}/reach-us`,
+    ];
+
+    let allContent = "";
+    const linkedin_re = /linkedin\.com\/(?:company|in)\/[\w-]+/;
+    const twitter_re  = /twitter\.com\/[\w-]+/;
+
+    for (const pageUrl of pages) {
+      await logToTerminal(jobId, `Scraping ${pageUrl}...`);
+      const content = await scrapeSinglePage(pageUrl);
+      allContent += " " + content;
+
+      const emails = extractEmails(content);
+      if (emails.length > 0) {
+        await logToTerminal(jobId, `✉ Email found: ${emails[0]}`);
+        break; // পেয়ে গেছি, আর scrape করতে হবে না
+      }
+    }
+
+    const emails   = extractEmails(allContent);
+    const linkedin = allContent.match(linkedin_re)?.[0] || null;
+    const twitter  = allContent.match(twitter_re)?.[0] || null;
 
     return {
       email:    emails[0] || null,
-      isHiring: detectHiring(content),
+      isHiring: detectHiring(allContent),
       linkedin: linkedin ? `https://${linkedin}` : null,
       twitter:  twitter  ? `https://${twitter}`  : null,
-      metaDescription: result?.metadata?.description || null,
+      metaDescription: null,
     };
-  } catch {
+  } catch (err) {
+    await logToTerminal(jobId, `Enrichment failed for ${website}: ${err.message}`);
     return {};
   }
 }
@@ -232,29 +264,28 @@ export async function runDiscoverScrape(inputData, userId, jobId, proxy) {
 
   await logToTerminal(jobId, `Starting: "${keyword}" in "${location}"`);
 
-  // Step 1: Smart search (Google Maps → SerpAPI fallback)
+  // Step 1: Search
   const results = await searchBusinesses(keyword, location, maxResults, jobId);
-
   if (results.length === 0) {
     await logToTerminal(jobId, `No results found`);
     return { count: 0, leads: [] };
   }
 
-  // Step 2: Website scrape + Apollo email
-  await logToTerminal(jobId, `Starting enrichment...`);
+  // Step 2: Multi-page enrichment + Apollo fallback
+  await logToTerminal(jobId, `Starting enrichment for ${results.length} businesses...`);
 
   for (const lead of results) {
-    // Firecrawl দিয়ে website scrape
+    // Firecrawl — multi-page
     if (lead.website) {
       const enriched = await enrichWebsite(lead.website, jobId);
       lead.email    = enriched.email    || null;
       lead.isHiring = enriched.isHiring || false;
-      lead.linkedin = enriched.linkedin || null;
+      lead.linkedin = enriched.linkedin || lead.linkedin || null;
       lead.twitter  = enriched.twitter  || null;
       lead.metaDescription = enriched.metaDescription || null;
     }
 
-    // Email না পেলে Apollo দিয়ে খোঁজো
+    // Email এখনো নেই → Apollo try করো
     if (!lead.email) {
       const domain = lead.website
         ? (() => { try { return new URL(lead.website).hostname.replace("www.", ""); } catch { return null; } })()
@@ -274,27 +305,27 @@ export async function runDiscoverScrape(inputData, userId, jobId, proxy) {
     await logToTerminal(jobId, `✓ ${lead.name} — email: ${lead.email || "none"}, score: ${lead.score}`);
   }
 
-  // Step 3: Database save
+  // Step 3: DB save
   await logToTerminal(jobId, `Saving ${results.length} leads...`);
 
   const leadsToInsert = results.map(lead => ({
-    org_id:        inputData.orgId,
-    source:        "google maps discover",
-    company:       lead.name,
-    name:          lead.name,
-    phone:         cleanPhone(lead.phone),
-    email:         lead.email         || null,
-    website:       lead.website       || null,
-    industry:      lead.industry      || null,
-    score:         lead.score,
-    lead_score:    lead.score,
-    address:       lead.address       || null,
-    is_hiring:     lead.isHiring      || false,
-    linkedin:      lead.linkedin      || null,
-    meta_description: lead.metaDescription || null,
-    contact_name:  lead.contactName   || null,
-    contact_title: lead.contactTitle  || null,
-    created_at:    new Date().toISOString(),
+    org_id:           inputData.orgId,
+    source:           "google maps discover",
+    company:          lead.name,
+    name:             lead.name,
+    phone:            cleanPhone(lead.phone),
+    email:            lead.email            || null,
+    website:          lead.website          || null,
+    industry:         lead.industry         || null,
+    score:            lead.score,
+    lead_score:       lead.score,
+    address:          lead.address          || null,
+    is_hiring:        lead.isHiring         || false,
+    linkedin:         lead.linkedin         || null,
+    meta_description: lead.metaDescription  || null,
+    contact_name:     lead.contactName      || null,
+    contact_title:    lead.contactTitle     || null,
+    created_at:       new Date().toISOString(),
   }));
 
   if (leadsToInsert.length > 0) {
