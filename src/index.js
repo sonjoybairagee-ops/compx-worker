@@ -11,8 +11,8 @@ import "dotenv/config";
 import { Worker, Queue } from "bullmq";
 import IORedis from "ioredis";
 import { runEnrichJob }    from "./jobs/enrichJob.js";
-import { runDeepScrape }   from "./jobs/deepScrapeJob.js";
 import { runDiscoverScrape } from "./jobs/discoverScrapeJob.js";
+import { runHiringSignals } from "./jobs/hiringSignalsJob.js";
 import { runVerifyEmail }  from "./jobs/verifyEmailJob.js";
 import { runWebhookJob }   from "./jobs/webhookJob.js";
 import { pollSupabaseJobs } from "./poller.js";
@@ -21,6 +21,8 @@ import { getBestProxy } from "../lib/proxy.js";
 import express from "express";
 import { createBullBoardRouter } from "./config/bullBoard.js";
 import { attachDLQListener } from "./config/dlqHandler.js";
+import { Server } from "socket.io";
+import http from "http";
 
 // helper
 function sleep(ms) {
@@ -88,11 +90,11 @@ async function processJob(job) {
       case "enrich":
         result = await runEnrichJob(input_data, user_id, proxy);
         break;
-      case "deep_scrape":
-        result = await runDeepScrape(input_data, user_id, proxy);
-        break;
       case "discover_scrape":
-        result = await runDiscoverScrape(input_data, user_id, job.id, proxy);
+        result = await runDiscoverScrape(input_data, user_id, job, proxy);
+        break;
+      case "hiring_signals":
+        result = await runHiringSignals(input_data, user_id, job);
         break;
       case "verify_email":
         result = await runVerifyEmail(input_data, user_id);
@@ -112,6 +114,26 @@ async function processJob(job) {
         latency: Date.now() - startTime,
         domain: routingCtx.domain
       });
+    }
+
+    // ── Chain of Jobs: Dispatch Child Enrichment Job if requested ──
+    if (type === "discover_scrape" && input_data?.enrichments) {
+      const { email, tech, ai } = input_data.enrichments;
+      if ((email || tech || ai) && result?.leads?.length > 0) {
+        const domains = [...new Set(result.leads.map(l => l.website).filter(Boolean))];
+        if (domains.length > 0) {
+          await jobQueue.add("enrich", {
+            type: "enrich",
+            user_id,
+            input_data: {
+              domains,
+              options: input_data.enrichments,
+              parentJobId: job.id
+            }
+          });
+          console.log(`[Worker] Enqueued child enrichment job for ${domains.length} domains`);
+        }
+      }
     }
 
   } catch (err) {
@@ -150,6 +172,10 @@ worker.on("completed", (job, result) => {
   console.log(`[Worker] ✓ ${job.data.type} job ${job.id} complete`);
 });
 
+worker.on("progress", (job, progress) => {
+  // We'll emit the event using Socket.IO below
+});
+
 worker.on("failed", async (job, err) => {
   console.error(`[Worker] ✗ Job ${job?.id} failed:`, err.message);
 
@@ -181,9 +207,35 @@ pollSupabaseJobs(jobQueue, supabase);
 console.log(`[Worker] 🚀 CompX Worker started — concurrency: ${CONCURRENCY}`);
 console.log(`[Worker] Redis: ${REDIS_URL}`);
 
-// ── Bull-Board Admin Dashboard ─────────────────────────────
+// ── Bull-Board & WebSocket Server ─────────────────────────────
 const app = express();
 app.use("/admin/queues", createBullBoardRouter());
-app.listen(3001, () => {
-  console.log("[Worker] 📊 Bull-Board: http://localhost:3001/admin/queues");
+
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: { origin: "*" }
+});
+
+io.on("connection", (socket) => {
+  console.log(`[Socket] Client connected: ${socket.id}`);
+  
+  socket.on("join", ({ userId, jobId }) => {
+    if (userId) socket.join(`user_${userId}`);
+    if (jobId) socket.join(`job_${jobId}`);
+    console.log(`[Socket] ${socket.id} joined rooms: user_${userId}, job_${jobId}`);
+  });
+});
+
+// Broadcast progress events from BullMQ to connected WebSocket clients
+worker.on("progress", (job, progress) => {
+  if (job.data && job.data.user_id) {
+    const userId = job.data.user_id;
+    const jobId = job.id;
+    // Broadcast to the user's room and the job's specific room
+    io.to(`user_${userId}`).to(`job_${jobId}`).emit("lead.progress", progress);
+  }
+});
+
+server.listen(3001, () => {
+  console.log("[Worker] 📊 Bull-Board & WS: http://localhost:3001");
 });

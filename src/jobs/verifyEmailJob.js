@@ -38,29 +38,28 @@ async function getMX(domain) {
   }
 }
 
-// ── ZeroBounce API (Replaces SMTP Port 25) ──────────────────────────────────
-async function zeroBounceCheck(email) {
-  const KEY = process.env.ZEROBOUNCE_API_KEY;
+// ── NeverBounce API ───────────────────────────────────────────────────────────
+async function neverBounceCheck(email) {
+  const KEY = process.env.NEVERBOUNCE_API_KEY;
   if (!KEY) {
-    console.warn("[VerifyEmail] ZEROBOUNCE_API_KEY is not set. Skipping API validation.");
+    console.warn("[VerifyEmail] NEVERBOUNCE_API_KEY not set. Skipping.");
     return { status: "unknown", code: null };
   }
 
   try {
-    const res = await fetch(
-      `https://api.zerobounce.net/v2/validate?api_key=${KEY}&email=${email}`
+    const res  = await fetch(
+      `https://api.neverbounce.com/v4/single/check?key=${KEY}&email=${encodeURIComponent(email)}`
     );
     const data = await res.json();
-    
-    // ZeroBounce returns: valid, invalid, catch-all, unknown, spamtrap, abuse, do_not_mail
-    return { 
-      status: data.status === "valid" ? "valid" : 
-              data.status === "invalid" ? "invalid" : 
-              data.status === "catch-all" ? "catch-all" : "unknown",
-      code: data.sub_status 
+    return {
+      status: data.result === "valid"      ? "valid"   :
+              data.result === "invalid"    ? "invalid" :
+              data.result === "disposable" ? "invalid" :
+              data.result === "catchall"   ? "risky"   : "unknown",
+      code: data.result,
     };
-  } catch (error) {
-    return { status: "error", code: null, message: error.message };
+  } catch (err) {
+    return { status: "unknown", code: null };
   }
 }
 
@@ -101,8 +100,8 @@ async function verifyOne(email) {
   result.checks.hasMX = mx.length > 0;
   if (!result.checks.hasMX) { result.status = "invalid"; result.score = 0; return result; }
 
-  // Layer 4: API Validation (ZeroBounce)
-  const apiCheck = await zeroBounceCheck(email);
+  // Layer 4: API Validation (NeverBounce)
+  const apiCheck = await neverBounceCheck(email);
   result.checks.smtp     = apiCheck.status;
   result.checks.smtpCode = apiCheck.code;
 
@@ -149,16 +148,27 @@ export async function runVerifyEmail(inputData, userId) {
   console.log(`[VerifyEmail] Best: ${best.email} — ${best.status} (${best.score})`);
 
   // ── Update lead in Supabase ───────────────────────────────────────────────
-  if (leadId && userId && best) {
-    await supabase
-      .from("extension_database")
-      .update({
-        email:          best.valid ? best.email : null,
-        email_verified: best.status,
-        email_score:    best.score,
-      })
-      .eq("id", leadId)
-      .eq("user_id", userId);
+  if (leadId && best) {
+    const updatePayload = {
+      email:          best.valid ? best.email : null,
+      email_verified: best.status,
+      email_score:    best.score,
+    };
+
+    if (inputData.sourceType === "discover") {
+      // leads table (new discover flow)
+      await supabase
+        .from("leads")
+        .update(updatePayload)
+        .eq("id", leadId);
+    } else {
+      // extension_database (old extension flow)
+      await supabase
+        .from("extension_database")
+        .update(updatePayload)
+        .eq("id", leadId)
+        .eq("user_id", userId);
+    }
   }
 
   return { results, best };
