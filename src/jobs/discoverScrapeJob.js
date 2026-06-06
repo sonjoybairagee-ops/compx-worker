@@ -1,6 +1,6 @@
 /**
  * CompX — discoverScrapeJob.js
- * SerpAPI + Firecrawl + Apollo email enrichment
+ * Google Maps API (primary) + SerpAPI (fallback) + Firecrawl + Apollo
  */
 
 import FirecrawlApp from "@mendable/firecrawl-js";
@@ -52,14 +52,62 @@ function calcScore(lead) {
   return Math.min(99, score);
 }
 
-// ── SerpAPI Google Maps Search ────────────────────────────────────────────────
-async function searchGoogleMaps(keyword, location, maxResults = 10) {
-  const apiKey = process.env.SERPAPI_API_KEY;
+// ── Google Maps API (Primary) ─────────────────────────────────────────────────
+async function searchWithGoogleMaps(keyword, location, maxResults = 10) {
+  const apiKey = process.env.GOOGLE_MAPS_API_KEY;
+  if (!apiKey) return null; // null = try fallback
 
-  if (!apiKey) {
-    console.warn("[DiscoverScrape] No SERPAPI_API_KEY found");
-    return [];
+  try {
+    const query = location ? `${keyword} in ${location}` : keyword;
+    const url = `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(query)}&key=${apiKey}`;
+
+    const res  = await fetch(url);
+    const json = await res.json();
+
+    if (json.status === "REQUEST_DENIED" || json.status === "OVER_QUERY_LIMIT") {
+      console.warn(`[DiscoverScrape] Google Maps status: ${json.status} — switching to SerpAPI`);
+      return null; // fallback
+    }
+
+    if (!json.results || json.results.length === 0) return null;
+
+    console.log(`[DiscoverScrape] Google Maps found ${json.results.length} results`);
+
+    // Place details (website + phone)
+    const results = json.results.slice(0, maxResults).map(place => ({
+      id:       `map_${place.place_id}`,
+      name:     place.name,
+      address:  place.formatted_address,
+      rating:   place.rating?.toString() || "",
+      industry: place.types?.[0]?.replace(/_/g, " ") || "",
+      website:  null,
+      phone:    null,
+      email:    null,
+      placeId:  place.place_id,
+    }));
+
+    // Place details থেকে website + phone নাও
+    for (const lead of results) {
+      if (lead.placeId) {
+        const detailUrl = `https://maps.googleapis.com/maps/api/place/details/json?place_id=${lead.placeId}&fields=website,formatted_phone_number&key=${apiKey}`;
+        const detailRes  = await fetch(detailUrl);
+        const detailJson = await detailRes.json();
+        lead.website = detailJson.result?.website || null;
+        lead.phone   = detailJson.result?.formatted_phone_number || null;
+      }
+    }
+
+    return results;
+  } catch (err) {
+    console.error("[DiscoverScrape] Google Maps error:", err.message);
+    return null; // fallback
   }
+}
+
+// ── SerpAPI (Fallback) ────────────────────────────────────────────────────────
+async function searchWithSerpAPI(keyword, location, maxResults = 10) {
+  const apiKey = process.env.SERPAPI_API_KEY;
+  if (!apiKey) return [];
 
   try {
     const query = location ? `${keyword} in ${location}` : keyword;
@@ -77,7 +125,7 @@ async function searchGoogleMaps(keyword, location, maxResults = 10) {
     console.log(`[DiscoverScrape] SerpAPI found ${places.length} results`);
 
     return places.slice(0, maxResults).map(place => ({
-      id:       `map_${place.place_id || Math.random()}`,
+      id:       `serp_${place.place_id || Math.random()}`,
       name:     place.title   || "",
       address:  place.address || "",
       rating:   place.rating?.toString() || "",
@@ -94,9 +142,22 @@ async function searchGoogleMaps(keyword, location, maxResults = 10) {
   }
 }
 
-// SerpAPI already website+phone দেয়
-async function getPlaceDetails(placeId) {
-  return {};
+// ── Smart Search — Google Maps first, SerpAPI fallback ───────────────────────
+async function searchBusinesses(keyword, location, maxResults, jobId) {
+  // Google Maps API try করো
+  await logToTerminal(jobId, `Trying Google Maps API...`);
+  const googleResults = await searchWithGoogleMaps(keyword, location, maxResults);
+
+  if (googleResults && googleResults.length > 0) {
+    await logToTerminal(jobId, `Google Maps: ${googleResults.length} results ✅`);
+    return googleResults;
+  }
+
+  // Fallback: SerpAPI
+  await logToTerminal(jobId, `Google Maps failed — switching to SerpAPI...`);
+  const serpResults = await searchWithSerpAPI(keyword, location, maxResults);
+  await logToTerminal(jobId, `SerpAPI: ${serpResults.length} results`);
+  return serpResults;
 }
 
 // ── Apollo Email Lookup ───────────────────────────────────────────────────────
@@ -107,7 +168,6 @@ async function getEmailFromApollo(companyName, domain, jobId) {
   try {
     await logToTerminal(jobId, `Apollo lookup: ${companyName}`);
 
-    // People search থেকে email খোঁজো
     const searchRes = await fetch("https://api.apollo.io/v1/mixed_people/search", {
       method: "POST",
       headers: {
@@ -172,10 +232,13 @@ export async function runDiscoverScrape(inputData, userId, jobId, proxy) {
 
   await logToTerminal(jobId, `Starting: "${keyword}" in "${location}"`);
 
-  // Step 1: SerpAPI দিয়ে Google Maps search
-  await logToTerminal(jobId, `Searching Google Maps via SerpAPI...`);
-  const results = await searchGoogleMaps(keyword, location, maxResults);
-  await logToTerminal(jobId, `Found ${results.length} businesses`);
+  // Step 1: Smart search (Google Maps → SerpAPI fallback)
+  const results = await searchBusinesses(keyword, location, maxResults, jobId);
+
+  if (results.length === 0) {
+    await logToTerminal(jobId, `No results found`);
+    return { count: 0, leads: [] };
+  }
 
   // Step 2: Website scrape + Apollo email
   await logToTerminal(jobId, `Starting enrichment...`);
