@@ -1,6 +1,6 @@
 /**
  * CompX — discoverScrapeJob.js
- * Firecrawl + Google Maps API + Apollo email enrichment
+ * SerpAPI + Firecrawl + Apollo email enrichment
  */
 
 import FirecrawlApp from "@mendable/firecrawl-js";
@@ -52,6 +52,53 @@ function calcScore(lead) {
   return Math.min(99, score);
 }
 
+// ── SerpAPI Google Maps Search ────────────────────────────────────────────────
+async function searchGoogleMaps(keyword, location, maxResults = 10) {
+  const apiKey = process.env.SERPAPI_API_KEY;
+
+  if (!apiKey) {
+    console.warn("[DiscoverScrape] No SERPAPI_API_KEY found");
+    return [];
+  }
+
+  try {
+    const query = location ? `${keyword} in ${location}` : keyword;
+    const url = `https://serpapi.com/search.json?engine=google_maps&q=${encodeURIComponent(query)}&api_key=${apiKey}&num=${maxResults}`;
+
+    const res  = await fetch(url);
+    const json = await res.json();
+
+    if (json.error) {
+      console.error("[DiscoverScrape] SerpAPI error:", json.error);
+      return [];
+    }
+
+    const places = json.local_results || [];
+    console.log(`[DiscoverScrape] SerpAPI found ${places.length} results`);
+
+    return places.slice(0, maxResults).map(place => ({
+      id:       `map_${place.place_id || Math.random()}`,
+      name:     place.title   || "",
+      address:  place.address || "",
+      rating:   place.rating?.toString() || "",
+      industry: place.type    || keyword || "",
+      website:  place.website || null,
+      phone:    place.phone   || null,
+      email:    null,
+      placeId:  null,
+    })).filter(r => r.name);
+
+  } catch (err) {
+    console.error("[DiscoverScrape] SerpAPI error:", err.message);
+    return [];
+  }
+}
+
+// SerpAPI already website+phone দেয়
+async function getPlaceDetails(placeId) {
+  return {};
+}
+
 // ── Apollo Email Lookup ───────────────────────────────────────────────────────
 async function getEmailFromApollo(companyName, domain, jobId) {
   const apiKey = process.env.APOLLO_API_KEY;
@@ -59,25 +106,6 @@ async function getEmailFromApollo(companyName, domain, jobId) {
 
   try {
     await logToTerminal(jobId, `Apollo lookup: ${companyName}`);
-
-    // Domain থেকে email খোঁজো
-    if (domain) {
-      const res = await fetch("https://api.apollo.io/v1/organizations/enrich", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Api-Key": apiKey,
-        },
-        body: JSON.stringify({ domain }),
-      });
-
-      const json = await res.json();
-      const org = json?.organization;
-
-      if (org?.sanitized_phone) {
-        return { email: null, phone: org.sanitized_phone, linkedin: org.linkedin_url || null };
-      }
-    }
 
     // People search থেকে email খোঁজো
     const searchRes = await fetch("https://api.apollo.io/v1/mixed_people/search", {
@@ -100,10 +128,10 @@ async function getEmailFromApollo(companyName, domain, jobId) {
       if (person.email && !person.email.includes("email_not_unlocked")) {
         await logToTerminal(jobId, `Apollo found: ${person.email}`);
         return {
-          email: person.email,
-          phone: person.phone_numbers?.[0]?.sanitized_number || null,
-          linkedin: person.linkedin_url || null,
-          contactName: `${person.first_name} ${person.last_name}`.trim(),
+          email:        person.email,
+          phone:        person.phone_numbers?.[0]?.sanitized_number || null,
+          linkedin:     person.linkedin_url || null,
+          contactName:  `${person.first_name} ${person.last_name}`.trim(),
           contactTitle: person.title || null,
         };
       }
@@ -116,46 +144,10 @@ async function getEmailFromApollo(companyName, domain, jobId) {
   }
 }
 
-// ── Google Maps API ───────────────────────────────────────────────────────────
-async function searchGoogleMaps(keyword, location, maxResults = 10) {
-  const apiKey = process.env.GOOGLE_MAPS_API_KEY;
-  if (!apiKey) return [];
-
-  const query = location ? `${keyword} in ${location}` : keyword;
-  const url = `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(query)}&key=${apiKey}`;
-
-  const res  = await fetch(url);
-  const json = await res.json();
-  if (!json.results) return [];
-
-  return json.results.slice(0, maxResults).map(place => ({
-    id:       `map_${place.place_id}`,
-    name:     place.name,
-    address:  place.formatted_address,
-    rating:   place.rating?.toString() || "",
-    industry: place.types?.[0]?.replace(/_/g, " ") || "",
-    website:  null,
-    phone:    null,
-    email:    null,
-    placeId:  place.place_id,
-  }));
-}
-
-async function getPlaceDetails(placeId) {
-  const apiKey = process.env.GOOGLE_MAPS_API_KEY;
-  if (!apiKey || !placeId) return {};
-  const url = `https://maps.googleapis.com/maps/api/place/details/json?place_id=${placeId}&fields=website,formatted_phone_number&key=${apiKey}`;
-  const res  = await fetch(url);
-  const json = await res.json();
-  return {
-    website: json.result?.website || null,
-    phone:   json.result?.formatted_phone_number || null,
-  };
-}
-
 // ── Firecrawl Website Enrichment ──────────────────────────────────────────────
 async function enrichWebsite(website, jobId) {
   try {
+    await logToTerminal(jobId, `Scraping ${website}...`);
     const result  = await firecrawl.scrapeUrl(website, { formats: ["markdown"], timeout: 15000 });
     const content = result?.markdown || "";
     const emails  = extractEmails(content);
@@ -164,7 +156,6 @@ async function enrichWebsite(website, jobId) {
 
     return {
       email:    emails[0] || null,
-      allEmails: emails,
       isHiring: detectHiring(content),
       linkedin: linkedin ? `https://${linkedin}` : null,
       twitter:  twitter  ? `https://${twitter}`  : null,
@@ -181,38 +172,29 @@ export async function runDiscoverScrape(inputData, userId, jobId, proxy) {
 
   await logToTerminal(jobId, `Starting: "${keyword}" in "${location}"`);
 
-  // Step 1: Google Maps
-  await logToTerminal(jobId, `Searching Google Maps...`);
+  // Step 1: SerpAPI দিয়ে Google Maps search
+  await logToTerminal(jobId, `Searching Google Maps via SerpAPI...`);
   const results = await searchGoogleMaps(keyword, location, maxResults);
   await logToTerminal(jobId, `Found ${results.length} businesses`);
 
-  // Step 2: Place details (website + phone)
-  for (const lead of results) {
-    if (lead.placeId) {
-      const details = await getPlaceDetails(lead.placeId);
-      lead.website = details.website || null;
-      lead.phone   = cleanPhone(details.phone) || null;
-    }
-  }
-
-  // Step 3: Website scrape + Apollo email
+  // Step 2: Website scrape + Apollo email
   await logToTerminal(jobId, `Starting enrichment...`);
 
   for (const lead of results) {
     // Firecrawl দিয়ে website scrape
     if (lead.website) {
       const enriched = await enrichWebsite(lead.website, jobId);
-      lead.email       = enriched.email    || null;
-      lead.isHiring    = enriched.isHiring || false;
-      lead.linkedin    = enriched.linkedin || null;
-      lead.twitter     = enriched.twitter  || null;
+      lead.email    = enriched.email    || null;
+      lead.isHiring = enriched.isHiring || false;
+      lead.linkedin = enriched.linkedin || null;
+      lead.twitter  = enriched.twitter  || null;
       lead.metaDescription = enriched.metaDescription || null;
     }
 
     // Email না পেলে Apollo দিয়ে খোঁজো
     if (!lead.email) {
       const domain = lead.website
-        ? new URL(lead.website).hostname.replace("www.", "")
+        ? (() => { try { return new URL(lead.website).hostname.replace("www.", ""); } catch { return null; } })()
         : null;
 
       const apolloData = await getEmailFromApollo(lead.name, domain, jobId);
@@ -229,27 +211,27 @@ export async function runDiscoverScrape(inputData, userId, jobId, proxy) {
     await logToTerminal(jobId, `✓ ${lead.name} — email: ${lead.email || "none"}, score: ${lead.score}`);
   }
 
-  // Step 4: Database save
+  // Step 3: Database save
   await logToTerminal(jobId, `Saving ${results.length} leads...`);
 
   const leadsToInsert = results.map(lead => ({
-    org_id:       inputData.orgId,
-    source:       "google maps discover",
-    company:      lead.name,
-    name:         lead.name,
-    phone:        lead.phone        || null,
-    email:        lead.email        || null,
-    website:      lead.website      || null,
-    industry:     lead.industry     || null,
-    score:        lead.score,
-    lead_score:   lead.score,
-    address:      lead.address      || null,
-    is_hiring:    lead.isHiring     || false,
-    linkedin:     lead.linkedin     || null,
+    org_id:        inputData.orgId,
+    source:        "google maps discover",
+    company:       lead.name,
+    name:          lead.name,
+    phone:         cleanPhone(lead.phone),
+    email:         lead.email         || null,
+    website:       lead.website       || null,
+    industry:      lead.industry      || null,
+    score:         lead.score,
+    lead_score:    lead.score,
+    address:       lead.address       || null,
+    is_hiring:     lead.isHiring      || false,
+    linkedin:      lead.linkedin      || null,
     meta_description: lead.metaDescription || null,
-    contact_name: lead.contactName  || null,
-    contact_title: lead.contactTitle || null,
-    created_at:   new Date().toISOString(),
+    contact_name:  lead.contactName   || null,
+    contact_title: lead.contactTitle  || null,
+    created_at:    new Date().toISOString(),
   }));
 
   if (leadsToInsert.length > 0) {
