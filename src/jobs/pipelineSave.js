@@ -8,7 +8,7 @@
  */
 
 import { supabase } from "../config/supabase.js";
-import { addToQueue } from "../../lib/queue.js";
+import { compxJobsQueue } from "../config/queueRegistry.ts";
 
 /**
  * Save scraped results to database_leads (staging).
@@ -82,10 +82,14 @@ async function triggerPipelineFilter(dbLeadId, orgId, userId) {
       .eq("id", dbLeadId);
 
     // Queue the filter job (via BullMQ)
-    await addToQueue("pipeline_filter", {
-      dbLeadId,
-      orgId,
-      userId,
+    await compxJobsQueue().add("pipeline_filter", {
+      type: "pipeline_filter",
+      user_id: userId,
+      input_data: {
+        dbLeadId,
+        orgId,
+        userId,
+      }
     });
   } catch (err) {
     console.error("[pipelineSave] triggerPipelineFilter error:", err.message);
