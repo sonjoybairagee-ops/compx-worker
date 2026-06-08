@@ -5,6 +5,7 @@ import { supabase } from "../config/supabase.js"
 import { runEnrichJob }      from "./enrichJob.js"
 import { runDeepScrape }     from "./deepScrapeJob.js"
 import { runVerifyEmail }    from "./verifyEmailJob.js"
+import { runPipelineFilter } from "./pipelineFilterJob.js"
 import { getBestProxy, markProxyFail, markProxySuccess } from "../../lib/proxy.js"
 import { analyzeJobRisk } from "../../lib/routingEngine.js"
 
@@ -19,12 +20,13 @@ function normalizeDomain(raw) {
 
 // ── Classify job type from input ──────────────────────────────────────────────
 function classifyJobType(input) {
-  const { type, source, emails, domains } = input
-  if (type) return type  // explicit override
-  if (emails?.length)  return "verify_email"
-  if (source === "google_maps" || source === "yellow_pages") return "deep_scrape"
-  if (domains?.length) return "enrich"
-  throw new Error("Cannot classify job — provide type, emails, or domains")
+  const { type, source, emails, domains, dbLeadId } = input;
+  if (type === "pipeline_filter" || dbLeadId) return "pipeline_filter";
+  if (type) return type;
+  if (emails?.length)     return "verify_email";
+  if (source === "google_maps" || source === "yellow_pages") return "deep_scrape";
+  if (domains?.length)    return "enrich";
+  throw new Error("Cannot classify job — provide type, emails, domains, or dbLeadId");
 }
 
 // ── Create job record in Supabase ─────────────────────────────────────────────
@@ -74,64 +76,60 @@ export async function dispatchJob(userId, input, mode = "realtime") {
 
 // ── Worker — runs job + proxy + progress updates ──────────────────────────────
 async function runJobWorker(jobId, userId, jobType, input) {
-
-  // 1. Risk + geo analysis
   const routing = analyzeJobRisk({
     domain:  input.domain || input.website,
     source:  input.source,
     country: input.country,
     type:    jobType,
-  })
+  });
 
-  console.log(`[Dispatcher] Job ${jobId} → risk:${routing.riskLevel} geo:${routing.preferredGeo ?? "any"} delay:${routing.delayMs}ms`)
+  const proxy   = getBestProxy(routing);
+  const started = Date.now();
 
-  // 2. Best proxy based on routing
-  const proxy   = getBestProxy(routing)
-  const started = Date.now()
-
-  // 3. Anti-bot delay
-  await sleep(routing.delayMs)
+  await sleep(routing.delayMs);
 
   try {
     await supabase.from("enrichment_jobs").update({
       status: "running", proxy_id: proxy?.id ?? null
-    }).eq("id", jobId)
+    }).eq("id", jobId);
 
-    let result
+    let result;
 
     if (jobType === "enrich") {
-      const domains = input.domains ?? [input.domain]
-      result = await runEnrichPipeline(domains, userId, jobId, proxy?.url, routing)
+      const domains = input.domains ?? [input.domain];
+      result = await runEnrichPipeline(domains, userId, jobId, proxy?.url, routing);
     } else if (jobType === "deep_scrape") {
-      result = await runDeepScrape({ ...input, proxyUrl: proxy?.url }, userId)
+      result = await runDeepScrape({ ...input, proxyUrl: proxy?.url }, userId);
     } else if (jobType === "verify_email") {
-      result = await runVerifyEmail({ ...input }, userId)
+      result = await runVerifyEmail({ ...input }, userId);
+    } else if (jobType === "pipeline_filter") {       // ← NEW
+      result = await runPipelineFilter({ ...input }, userId);
     }
 
-    if (result?.paused) return
+    if (result?.paused) return;
 
-    const latency = Date.now() - started
-    if (proxy) await markProxySuccess(proxy.id, latency)
+    const latency = Date.now() - started;
+    if (proxy) await markProxySuccess(proxy.id, latency);
 
     await supabase.from("enrichment_jobs").update({
       status:         "completed",
       progress:       100,
       result_summary: result,
       completed_at:   new Date().toISOString(),
-    }).eq("id", jobId)
+    }).eq("id", jobId);
 
     if (input.auto_verify && result?.emails?.length) {
       await dispatchJob(userId, {
         type: "verify_email", emails: result.emails, leadId: input.leadId
-      }, "queue")
+      }, "queue");
     }
 
   } catch (err) {
-    if (proxy) await markProxyFail(proxy.id)
+    if (proxy) await markProxyFail(proxy.id);
     await supabase.from("enrichment_jobs").update({
       status: "failed", error_msg: err.message,
-    }).eq("id", jobId)
-    throw err
+    }).eq("id", jobId);
+    throw err;
   }
 }
 

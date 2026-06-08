@@ -6,6 +6,7 @@
 
 import FirecrawlApp from "@mendable/firecrawl-js";
 import { supabase } from "../config/supabase.js";
+import { saveToDatabaseLeads } from "./pipelineSave.js";
 
 const firecrawl = new FirecrawlApp({ apiKey: process.env.FIRECRAWL_API_KEY || "dummy_key_for_dev_mode" });
 
@@ -488,29 +489,10 @@ export async function runDiscoverScrape(inputData, userId, job, proxy) {
   // ── Step 3: DB save ───────────────────────────────────────────────────────────
   await logToTerminal(jobId, `Saving ${processedLeads.length} leads...`);
 
-  const leadsToInsert = processedLeads.map(lead => ({
-    org_id:           inputData.orgId,
-    source:           source,
-    company:          lead.name,
-    name:             lead.name,
-    phone:            cleanPhone(lead.phone),
-    email:            lead.email            || null,
-    website:          lead.website          || null,
-    industry:         lead.industry         || null,
-    score:            lead.score,
-    lead_score:       lead.score,
-    address:          lead.address          || null,
-    is_hiring:        lead.isHiring         || false,
-    linkedin:         lead.linkedin         || null,
-    meta_description: lead.metaDescription  || null,
-    contact_name:     lead.contactName      || null,
-    contact_title:    lead.contactTitle     || null,
-    created_at:       new Date().toISOString(),
-  }));
-
-  if (leadsToInsert.length > 0) {
-    const { error } = await supabase.from("leads").insert(leadsToInsert);
-    if (error) {
+  if (processedLeads.length > 0) {
+    try {
+      await saveToDatabaseLeads(processedLeads, userId, inputData.orgId, source);
+    } catch (error) {
       await logToTerminal(jobId, `[ERROR] DB save failed: ${error.message}`);
       throw error;
     }

@@ -15,6 +15,7 @@ import { runDiscoverScrape } from "./jobs/discoverScrapeJob.js";
 import { runHiringSignals } from "./jobs/hiringSignalsJob.js";
 import { runVerifyEmail }  from "./jobs/verifyEmailJob.js";
 import { runWebhookJob }   from "./jobs/webhookJob.js";
+import { runPipelineFilter } from "./jobs/pipelineFilterJob.js";
 import { pollSupabaseJobs } from "./poller.js";
 import { analyzeJobRisk, updateBrainFeedback } from "../lib/scrapingBrain.js";
 import { getBestProxy } from "../lib/proxy.js";
@@ -101,6 +102,9 @@ async function processJob(job) {
         break;
       case "webhook":
         result = await runWebhookJob(input_data);
+        break;
+      case "pipeline_filter":
+        result = await runPipelineFilter(input_data, user_id);
         break;
       default:
         throw new Error(`Unknown job type: ${type}`);

@@ -126,48 +126,93 @@ async function verifyOne(email) {
 
 // ── Main verify job ───────────────────────────────────────────────────────────
 export async function runVerifyEmail(inputData, userId) {
-  const { email, emails, leadId } = inputData;
+  const { email, emails, leadId, orgId } = inputData;
 
-  // Bulk or single
   const list = emails?.length ? emails : (email ? [email] : []);
   if (!list.length) return { error: "No emails provided" };
 
-  console.log(`[VerifyEmail] Verifying ${list.length} email(s)`);
+  console.log(`[VerifyEmail] Verifying ${list.length} email(s) for lead ${leadId}`);
 
   const results = [];
   for (const e of list) {
-    const r = await verifyOne(e);
+    const r = await verifyOne(e);    // verifyOne is unchanged from your existing code
     results.push(r);
-    await new Promise(res => setTimeout(res, 300)); // rate limit safe
+    await new Promise(res => setTimeout(res, 300));
   }
 
-  // Sort by score descending
   results.sort((a, b) => b.score - a.score);
   const best = results[0];
 
   console.log(`[VerifyEmail] Best: ${best.email} — ${best.status} (${best.score})`);
 
-  // ── Update lead in Supabase ───────────────────────────────────────────────
-  if (leadId && best) {
-    const updatePayload = {
-      email:          best.valid ? best.email : null,
-      email_verified: best.status,
-      email_score:    best.score,
-    };
+  // ── 1 credit deduct ───────────────────────────────────────────────────────
+  if (orgId) {
+    try {
+      await supabase.rpc("deduct_credits", { p_org_id: orgId, p_amount: 1 });
+    } catch (err) {
+      console.error("[VerifyEmail] Credit deduct error:", err.message);
+    }
+  }
 
-    if (inputData.sourceType === "discover") {
-      // leads table (new discover flow)
+  // ── Update lead in Supabase ───────────────────────────────────────────────
+  if (leadId) {
+    if (best.status === "invalid") {
+      // ── Invalid email → dump to garbage, notify user ─────────────────────
+      console.log(`[VerifyEmail] Email invalid → dumping lead ${leadId} to garbage`);
+
+      // Fetch lead data for snapshot
+      const { data: leadData } = await supabase
+        .from("leads")
+        .select("*")
+        .eq("id", leadId)
+        .single();
+
+      // Dump to garbage_bin
+      await supabase.from("garbage_bin").insert({
+        org_id:       orgId || leadData?.org_id,
+        user_id:      userId,
+        source_table: "leads",
+        source_id:    leadId,
+        reason:       "email_invalid",
+        data:         { ...leadData, verify_result: best },
+        notified:     false,
+        expires_at:   new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+      });
+
+      // Update lead status to 'invalid_email' so UI can hide/flag it
       await supabase
         .from("leads")
-        .update(updatePayload)
+        .update({
+          email_verified: "invalid",
+          email_score:    best.score,
+          status:         "invalid_email",
+          updated_at:     new Date().toISOString(),
+        })
         .eq("id", leadId);
+
+      // Notify user
+      try {
+        await supabase.from("notifications").insert({
+          user_id: userId,
+          type:    "email_invalid",
+          title:   "Email verification failed",
+          message: `Email ${best.email} is invalid — lead moved to garbage.`,
+          data:    { leadId, email: best.email, score: best.score },
+          read:    false,
+        });
+      } catch { /* notifications table optional */ }
+
     } else {
-      // extension_database (old extension flow)
+      // ── Valid/risky email → update lead with verified status ──────────────
       await supabase
-        .from("extension_database")
-        .update(updatePayload)
-        .eq("id", leadId)
-        .eq("user_id", userId);
+        .from("leads")
+        .update({
+          email:          best.valid ? best.email : undefined,
+          email_verified: best.status,    // 'valid' | 'risky' | 'unknown'
+          email_score:    best.score,
+          updated_at:     new Date().toISOString(),
+        })
+        .eq("id", leadId);
     }
   }
 
