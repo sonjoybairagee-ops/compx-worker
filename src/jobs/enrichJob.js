@@ -125,9 +125,10 @@ export async function runEnrichJob(inputData, userId) {
   }
 
   const domain = website.replace(/^https?:\/\//, "").replace(/^www\./, "").split("/")[0];
-  const baseUrl = `https://${domain}`;
+  const isHttp = website.startsWith("http://");
+  const baseUrl = `${isHttp ? "http" : "https"}://${domain}`;
 
-  console.log(`[EnrichJob] Enriching: ${domain}`);
+  console.log(`[EnrichJob] Enriching: ${domain} (using ${baseUrl})`);
 
   const result = {
     domain,
@@ -136,6 +137,7 @@ export async function runEnrichJob(inputData, userId) {
     personal_email: null,
     phones:      [],
     socials:     {},
+    social_links: {},
     techStack:   [],
     description: "",
     schema:      {},
@@ -183,6 +185,7 @@ export async function runEnrichJob(inputData, userId) {
       if (url === baseUrl || url === baseUrl + "/") {
         result.techStack = detectTechStack(html);
         result.socials   = extractSocials(html);
+        result.social_links = result.socials;
         result.schema    = extractSchemaOrg(html);
         result.description = $('meta[name="description"], meta[property="og:description"]').attr("content") || "";
       }
@@ -210,6 +213,11 @@ export async function runEnrichJob(inputData, userId) {
       maxRequestsPerCrawl: 6,
       maxConcurrency: 2,
       requestHandlerTimeoutSecs: 25,
+      launchContext: {
+        launchOptions: {
+          ignoreHTTPSErrors: true,
+        },
+      },
       preNavigationHooks: [
         async ({ page }) => {
           await page.setRequestInterception(true);
@@ -244,7 +252,7 @@ export async function runEnrichJob(inputData, userId) {
 
         if (url === baseUrl || url === baseUrl + "/") {
           if (!result.techStack.length) result.techStack = detectTechStack(html);
-          if (!Object.keys(result.socials).length) result.socials = extractSocials(html);
+          if (!Object.keys(result.socials).length) { result.socials = extractSocials(html); result.social_links = result.socials; }
           if (!Object.keys(result.schema).length) result.schema = extractSchemaOrg(html);
           if (!result.description) {
             result.description = await page.$eval(
@@ -309,66 +317,71 @@ export async function runEnrichJob(inputData, userId) {
     phone:            finalPhone,
     description:      finalDescription,
     linkedin_url:     result.socials.linkedin || null,
+    social_links:     result.socials || {},
     phone_found:      result.phone_found,
     linkedin_matched: result.linkedin_matched,
     crm_ready:        result.crm_ready
   };
 
-  if (inputData.sourceType === "discover") {
-    let leadScore = 0;
-    if (inputData.website || website) leadScore += 20;
-    if (updateData.phone || inputData.phone) leadScore += 30;
-    if (result.emails.length > 0) leadScore += 40;
-    if (result.linkedin_matched) leadScore += 10;
-    if (inputData.hiring_signal) leadScore += 10;
-    
-    const isQualified = leadScore >= 40;
-    
-    if (isQualified) {
-      // It's CRM ready -> Insert into leads table directly!
-      const orgId = inputData.orgId || userId;
-      
-      const newLead = {
-        org_id: orgId,
-        source: inputData.source || "google maps discover",
-        company: companyName || inputData.company || inputData.name,
-        name: inputData.name,
-        phone: updateData.phone || inputData.phone || null,
-        email: updateData.email || inputData.email || null,
-        emails: result.emails.length > 0 ? result.emails : (inputData.email ? [inputData.email] : []),
-        work_email: result.work_email || null,
-        personal_email: result.personal_email || null,
-        website: inputData.website || website || null,
-        industry: inputData.industry || null,
-        score: leadScore,
-        lead_score: leadScore,
-        hiring_signal: inputData.hiring_signal || false,
-        linkedin_url: result.socials.linkedin || null,
-        phone_found: result.phone_found,
-        linkedin_matched: result.linkedin_matched,
-        crm_ready: result.crm_ready,
-        description: finalDescription || null,
-        created_at: new Date().toISOString(),
-        metadata: {
-          enriched: true,
-          socials: result.socials,
-          techStack: result.techStack
-        }
-      };
-
-      await supabase.from("leads").insert(newLead);
-      console.log(`[EnrichJob] Inserted qualified lead into leads table: ${newLead.company}`);
-      
-      if (inputData.discovered_lead_id) {
-        await supabase.from("discovered_leads").update({ status: 'enriched' }).eq('id', inputData.discovered_lead_id);
-      }
-    } else {
-      console.log(`[EnrichJob] Lead score too low (${leadScore}). Kept in staging.`);
-      if (inputData.discovered_lead_id) {
-        await supabase.from("discovered_leads").update({ status: 'failed' }).eq('id', inputData.discovered_lead_id);
-      }
-    }
-  } else if (leadId && (result.emails.length > 0 || result.phone_found || result.linkedin_matched)) {
+  // [DISABLED] sourceType === "discover" insert block removed — pipelineFilterJob already
+  // handles promote_to_lead, so inserting here caused duplicate leads in leads_verified.
+  // if (inputData.sourceType === "discover") {
+  //   let leadScore = 0;
+  //   if (inputData.website || website) leadScore += 20;
+  //   if (updateData.phone || inputData.phone) leadScore += 30;
+  //   if (result.emails.length > 0) leadScore += 40;
+  //   if (result.linkedin_matched) leadScore += 10;
+  //   if (inputData.hiring_signal) leadScore += 10;
+  //
+  //   const isQualified = leadScore >= 40;
+  //
+  //   if (isQualified) {
+  //     // It's CRM ready -> Insert into leads table directly!
+  //     const orgId = inputData.orgId || userId;
+  //
+  //     const newLead = {
+  //       org_id: orgId,
+  //       source: inputData.source || "google maps discover",
+  //       company: companyName || inputData.company || inputData.name,
+  //       name: inputData.name,
+  //       phone: updateData.phone || inputData.phone || null,
+  //       email: updateData.email || inputData.email || null,
+  //       emails: result.emails.length > 0 ? result.emails : (inputData.email ? [inputData.email] : []),
+  //       work_email: result.work_email || null,
+  //       personal_email: result.personal_email || null,
+  //       website: inputData.website || website || null,
+  //       industry: inputData.industry || null,
+  //       score: leadScore,
+  //       lead_score: leadScore,
+  //       hiring_signal: inputData.hiring_signal || false,
+  //       linkedin_url: result.socials.linkedin || null,
+  //       social_links: result.socials || {},
+  //       phone_found: result.phone_found,
+  //       linkedin_matched: result.linkedin_matched,
+  //       crm_ready: result.crm_ready,
+  //       description: finalDescription || null,
+  //       created_at: new Date().toISOString(),
+  //       metadata: {
+  //         enriched: true,
+  //         socials: result.socials,
+  //         techStack: result.techStack
+  //       }
+  //     };
+  //
+  //     await supabase.from("leads_verified").insert(newLead);
+  //     console.log(`[EnrichJob] Inserted qualified lead into leads table: ${newLead.company}`);
+  //
+  //     if (inputData.discovered_lead_id) {
+  //       await supabase.from("discovered_leads").update({ status: 'enriched' }).eq('id', inputData.discovered_lead_id);
+  //     }
+  //   } else {
+  //     console.log(`[EnrichJob] Lead score too low (${leadScore}). Kept in staging.`);
+  //     if (inputData.discovered_lead_id) {
+  //       await supabase.from("discovered_leads").update({ status: 'failed' }).eq('id', inputData.discovered_lead_id);
+  //     }
+  //   }
+  // } else
+  if (leadId && (result.emails.length > 0 || result.phone_found || result.linkedin_matched)) {
     // It came from extension -> Update existing extension_database row
     await supabase
       .from("extension_database")

@@ -16,6 +16,8 @@ import { runHiringSignals } from "./jobs/hiringSignalsJob.js";
 import { runVerifyEmail }  from "./jobs/verifyEmailJob.js";
 import { runWebhookJob }   from "./jobs/webhookJob.js";
 import { runPipelineFilter } from "./jobs/pipelineFilterJob.js";
+import { runDripJob } from "./jobs/dripJob.js";
+
 import { pollSupabaseJobs } from "./poller.js";
 import { analyzeJobRisk, updateBrainFeedback } from "../lib/scrapingBrain.js";
 import { getBestProxy } from "../lib/proxy.js";
@@ -56,6 +58,8 @@ redis.on("error",   e  => console.error("[Worker] Redis error:", e.message));
 
 // ── BullMQ queue ──────────────────────────────────────────────────────────────
 export const jobQueue = new Queue("compx-jobs", { connection: redis });
+export const dripQueue = new Queue("drip-jobs", { connection: redis });
+
 
 // ── Job dispatcher ────────────────────────────────────────────────────────────
 async function processJob(job) {
@@ -160,7 +164,10 @@ async function processJob(job) {
   return result;
 }
 
-// ── BullMQ Worker ─────────────────────────────────────────────────────────────
+// ── Initialize Workers ─────────────────────────────────────────────────────────
+
+console.log(`[Worker] Starting compx-jobs processor (concurrency: ${CONCURRENCY})`);
+
 const worker = new Worker("compx-jobs", processJob, {
   connection:      redis,
   concurrency:     CONCURRENCY,
@@ -181,20 +188,36 @@ worker.on("progress", (job, progress) => {
 });
 
 worker.on("failed", async (job, err) => {
-  console.error(`[Worker] ✗ Job ${job?.id} failed:`, err.message);
+  console.error(`[Worker compx-jobs] Failed: ${job?.id} → ${err.message}`);
 
   if (job) {
     const isFinal = job.attemptsMade >= (job.opts.attempts ?? 3);
-    
-    await supabase
-      .from("jobs")
-      .update({
-        status:     isFinal ? "failed" : "pending",
-        error:      err.message,
-        retry_count: job.attemptsMade,
-      })
-      .eq("id", job.data.id || job.id);
+    await supabase.from("jobs").update({
+      status: "failed",
+      error_detail: `${err.message} (Attempt ${job.attemptsMade})`
+    }).eq("id", job.id);
   }
+});
+
+console.log(`[Worker] Starting drip-jobs processor (concurrency: ${CONCURRENCY})`);
+
+const dripWorker = new Worker("drip-jobs", async (job) => {
+  return await runDripJob(job.data);
+}, {
+  connection: redis,
+  concurrency: CONCURRENCY,
+  limiter: {
+    max: 5,
+    duration: 1000,
+  },
+});
+
+dripWorker.on("completed", (job) => {
+  console.log(`[Worker drip-jobs] Completed: ${job.id}`);
+});
+
+dripWorker.on("failed", (job, err) => {
+  console.error(`[Worker drip-jobs] Failed: ${job?.id} → ${err.message}`);
 });
 
 worker.on("error", err => {

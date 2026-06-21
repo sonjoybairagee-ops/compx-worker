@@ -21,7 +21,7 @@ export async function runPipelineFilter(inputData, userId) {
 
   // 1. Fetch the staging record
   const { data: dbLead, error: fetchErr } = await supabase
-    .from("database_leads")
+    .from("leads_staging")
     .select("*")
     .eq("id", dbLeadId)
     .single();
@@ -52,19 +52,35 @@ export async function runPipelineFilter(inputData, userId) {
 
 // ── Enrich via website, then decide ──────────────────────────────────────────
 async function enrichAndDecide(dbLead, userId, orgId) {
-  // Mark attempts
+  // Mark attempts and queue processing
   await supabase
-    .from("database_leads")
+    .from("leads_staging")
     .update({
       enrich_attempts: (dbLead.enrich_attempts || 0) + 1,
       updated_at: new Date().toISOString(),
     })
     .eq("id", dbLead.id);
 
+  await supabase
+    .from("leads_enrichment_queue")
+    .update({ status: "processing", updated_at: new Date().toISOString() })
+    .eq("staging_id", dbLead.id);
+
   let enrichResult = null;
   try {
     enrichResult = await runEnrichJob(
-      { website: dbLead.website, domain: dbLead.website },
+      {
+        website:    dbLead.website,
+        domain:     dbLead.website,
+        sourceType: "discover",          // ← enrichJob এ leads_verified এ insert করবে
+        orgId:      orgId || dbLead.org_id,
+        company:    dbLead.company || dbLead.name,
+        name:       dbLead.name,
+        industry:   dbLead.industry,
+        phone:      dbLead.phone,
+        address:    dbLead.address,
+        source:     dbLead.source,
+      },
       userId
     );
   } catch (err) {
@@ -77,23 +93,30 @@ async function enrichAndDecide(dbLead, userId, orgId) {
   const socialLinks  = enrichResult?.social_links || {};
 
   if (!email) {
-    // Enrichment found nothing useful → garbage
-    console.log(`[PipelineFilter] Enrichment returned no email → garbage`);
+    // Has website but no email found → keep in staging for manual review
+    // (do NOT garbage — website means it could still be a valid lead)
+    console.log(`[PipelineFilter] Enrichment returned no email → keeping in staging (has website)`);
     await supabase
-      .from("database_leads")
-      .update({ status: "failed", updated_at: new Date().toISOString() })
+      .from("leads_staging")
+      .update({
+        status:       "failed", // UI expects 'failed' for retryable, or 'enriched' if successful
+        phone:        phone || dbLead.phone || null,
+        social_links: socialLinks,
+        updated_at:   new Date().toISOString(),
+      })
       .eq("id", dbLead.id);
 
-    return await dumpToGarbage(
-      { ...dbLead, enrichResult },
-      orgId,
-      "enrichment_failed"
-    );
+    await supabase
+      .from("leads_enrichment_queue")
+      .update({ status: "failed", updated_at: new Date().toISOString() })
+      .eq("staging_id", dbLead.id);
+
+    return { kept: true, reason: "no_email_but_has_website" };
   }
 
   // Update database_lead with enriched data
   await supabase
-    .from("database_leads")
+    .from("leads_staging")
     .update({
       email,
       phone:        phone        || dbLead.phone,
@@ -102,6 +125,11 @@ async function enrichAndDecide(dbLead, userId, orgId) {
       updated_at:   new Date().toISOString(),
     })
     .eq("id", dbLead.id);
+
+  await supabase
+    .from("leads_enrichment_queue")
+    .update({ status: "completed", updated_at: new Date().toISOString() })
+    .eq("staging_id", dbLead.id);
 
   // Promote to leads table
   const updatedLead = { ...dbLead, email, phone: phone || dbLead.phone, social_links: socialLinks };
@@ -112,7 +140,7 @@ async function enrichAndDecide(dbLead, userId, orgId) {
 // ── Promote database_lead → leads table (using DB function) ──────────────────
 async function promoteToLeads(dbLead, orgId) {
   const { data, error } = await supabase
-    .rpc("promote_to_lead", { p_db_lead_id: dbLead.id });
+    .rpc("promote_to_lead", { p_staging_id: dbLead.id });
 
   if (error) {
     console.error("[PipelineFilter] promote_to_lead RPC error:", error.message);
@@ -130,7 +158,7 @@ async function dumpToGarbage(dbLead, orgId, reason) {
     .insert({
       org_id:       orgId,
       user_id:      dbLead.user_id,
-      source_table: "database_leads",
+      source_table: "leads_staging",
       source_id:    dbLead.id,
       reason,
       data:         dbLead,

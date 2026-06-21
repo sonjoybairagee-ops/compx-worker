@@ -3,7 +3,7 @@
  * worker/src/jobs/pipelineSave.js
  *
  * discoverScrapeJob এর শেষে এই function call করুন।
- * leads table এ সরাসরি না গিয়ে database_leads (staging) এ যাবে।
+ * leads table এ সরাসরি না গিয়ে leads_staging (staging) এ যাবে।
  * তারপর pipelineFilterJob চেক করবে কোনটা enrich দরকার।
  */
 
@@ -11,7 +11,7 @@ import { supabase } from "../config/supabase.js";
 import { compxJobsQueue } from "../config/queueRegistry.ts";
 
 /**
- * Save scraped results to database_leads (staging).
+ * Save scraped results to leads_staging (staging).
  * Call this instead of inserting directly to leads table.
  *
  * @param {Object[]} results  - Array of scraped company objects
@@ -42,13 +42,13 @@ export async function saveToDatabaseLeads(results, userId, orgId, source = "disc
       status:   "pending",
     };
 
-    // If scraper already found email/phone, include them
+    // If scraper already found email/phone, include them (extra fields live in raw)
     if (item.email)         row.email = item.email;
     if (item.phone)         row.phone = item.phone;
     if (item.social_links)  row.social_links = item.social_links;
 
     const { data, error } = await supabase
-      .from("database_leads")
+      .from("leads_staging")
       .insert(row)
       .select("id")
       .single();
@@ -65,7 +65,7 @@ export async function saveToDatabaseLeads(results, userId, orgId, source = "disc
     await triggerPipelineFilter(data.id, orgId, userId);
   }
 
-  console.log(`[pipelineSave] Saved ${saved}/${results.length} to database_leads (${errors} errors)`);
+  console.log(`[pipelineSave] Saved ${saved}/${results.length} to leads_staging (${errors} errors)`);
   return { saved, errors };
 }
 
@@ -77,7 +77,7 @@ async function triggerPipelineFilter(dbLeadId, orgId, userId) {
   try {
     // Mark as enriching
     await supabase
-      .from("database_leads")
+      .from("leads_staging")
       .update({ status: "enriching", updated_at: new Date().toISOString() })
       .eq("id", dbLeadId);
 
