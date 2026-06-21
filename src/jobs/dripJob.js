@@ -1,5 +1,5 @@
 import { supabase } from "../config/supabase.js";
-import { fetchWithAuth } from "../../../src/lib/fetchWithAuth.js"; // or wherever we put it, but wait, worker has no access to src/lib/fetchWithAuth...
+ // or wherever we put it, but wait, worker has no access to src/lib/fetchWithAuth...
 // I will just use standard fetch or supabase.
 
 export async function runDripJob(jobData) {
