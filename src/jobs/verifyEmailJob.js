@@ -1,20 +1,14 @@
 /**
- * CompX Worker — src/jobs/verifyEmailJob.js
- * Server-side email verification — NeverBounce/ZeroBounce method
+ * CompX Worker — src/jobs/verifyEmailJob.js (FIXED)
  *
- * Layers:
- * 1. Syntax check
- * 2. Disposable domain check
- * 3. DNS MX record lookup
- * 4. SMTP RCPT TO handshake
- * 5. Risk scoring
- * 6. Store result back to Supabase
+ * Fixes applied:
+ *   1. Score logic bug — "catch-all" vs "risky" mismatch
+ *   2. patternScore() আলাদাভাবে score এ যোগ হচ্ছে না ছিল — এখন যোগ হচ্ছে
  */
 
 import dns from "dns/promises";
 import { supabase } from "../config/supabase.js";
 
-// ── Disposable domains ────────────────────────────────────────────────────────
 const DISPOSABLE = new Set([
   "mailinator.com","guerrillamail.com","10minutemail.com","tempmail.com",
   "throwam.com","yopmail.com","sharklasers.com","trashmail.com",
@@ -23,12 +17,10 @@ const DISPOSABLE = new Set([
   "filzmail.com","discard.email","yopmail.fr","guerrillamail.info",
 ]);
 
-// ── Syntax check ──────────────────────────────────────────────────────────────
 function checkSyntax(email) {
   return /^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$/.test(email?.trim() || "");
 }
 
-// ── MX record lookup ──────────────────────────────────────────────────────────
 async function getMX(domain) {
   try {
     const records = await dns.resolveMx(domain);
@@ -38,7 +30,6 @@ async function getMX(domain) {
   }
 }
 
-// ── NeverBounce API ───────────────────────────────────────────────────────────
 async function neverBounceCheck(email) {
   const KEY = process.env.NEVERBOUNCE_API_KEY;
   if (!KEY) {
@@ -51,19 +42,23 @@ async function neverBounceCheck(email) {
       `https://api.neverbounce.com/v4/single/check?key=${KEY}&email=${encodeURIComponent(email)}`
     );
     const data = await res.json();
+
+    // FIX 1: NeverBounce "catchall" → আমাদের "catchall" status এ map করুন
+    // আগে: "catchall" → "risky" return করত, কিন্তু score logic "catch-all" খুঁজত
+    // ফলে catch-all এর 10 points কখনো apply হত না
     return {
-      status: data.result === "valid"      ? "valid"   :
-              data.result === "invalid"    ? "invalid" :
-              data.result === "disposable" ? "invalid" :
-              data.result === "catchall"   ? "risky"   : "unknown",
+      status: data.result === "valid"      ? "valid"    :
+              data.result === "invalid"    ? "invalid"  :
+              data.result === "disposable" ? "invalid"  :
+              data.result === "catchall"   ? "catchall" : // FIX: "risky" → "catchall"
+              "unknown",
       code: data.result,
     };
-  } catch (err) {
+  } catch {
     return { status: "unknown", code: null };
   }
 }
 
-// ── Pattern confidence score ──────────────────────────────────────────────────
 function patternScore(email) {
   const prefix = email.split("@")[0].toLowerCase();
   if (/^[a-z]+\.[a-z]+$/.test(prefix))                     return 90; // john.doe
@@ -74,7 +69,6 @@ function patternScore(email) {
   return 50;
 }
 
-// ── Single email verify ───────────────────────────────────────────────────────
 async function verifyOne(email) {
   const result = {
     email,
@@ -100,21 +94,24 @@ async function verifyOne(email) {
   result.checks.hasMX = mx.length > 0;
   if (!result.checks.hasMX) { result.status = "invalid"; result.score = 0; return result; }
 
-  // Layer 4: API Validation (NeverBounce)
+  // Layer 4: NeverBounce
   const apiCheck = await neverBounceCheck(email);
   result.checks.smtp     = apiCheck.status;
   result.checks.smtpCode = apiCheck.code;
 
-  // Layer 5: Score
-  const base   = result.checks.syntax ? 30 : 0;
-  const mxPts  = result.checks.hasMX  ? 20 : 0;
-  const pattern = patternScore(email);
-  const smtpPts =
-    result.checks.smtp === "valid"    ? 40 :
-    result.checks.smtp === "catch-all"? 10 :
-    result.checks.smtp === "invalid"  ? -60 : 0;
+  // FIX 1: score logic — "catchall" এখন match করবে
+  // আগে: smtp === "catch-all" খুঁজত কিন্তু return value ছিল "risky" → 10pts কখনো apply হত না
+  const base      = result.checks.syntax ? 30 : 0;
+  const mxPts     = result.checks.hasMX  ? 20 : 0;
+  const patternPts = patternScore(email); // FIX 2: patternScore score এ যোগ হচ্ছে
 
-  result.score  = Math.max(0, Math.min(100, base + mxPts + smtpPts));
+  const smtpPts =
+    result.checks.smtp === "valid"   ? 40  :
+    result.checks.smtp === "catchall"? 10  : // FIX 1: "catchall" এখন match করে
+    result.checks.smtp === "invalid" ? -60 : 0;
+
+  // patternScore weighted — API result এর চেয়ে কম weight
+  result.score = Math.max(0, Math.min(100, base + mxPts + smtpPts + Math.round(patternPts * 0.1)));
   result.valid  = result.score >= 70;
   result.status =
     result.score >= 80 ? "valid"   :
@@ -124,7 +121,6 @@ async function verifyOne(email) {
   return result;
 }
 
-// ── Main verify job ───────────────────────────────────────────────────────────
 export async function runVerifyEmail(inputData, userId) {
   const { email, emails, leadId, orgId } = inputData;
 
@@ -135,7 +131,7 @@ export async function runVerifyEmail(inputData, userId) {
 
   const results = [];
   for (const e of list) {
-    const r = await verifyOne(e);    // verifyOne is unchanged from your existing code
+    const r = await verifyOne(e);
     results.push(r);
     await new Promise(res => setTimeout(res, 300));
   }
@@ -145,7 +141,6 @@ export async function runVerifyEmail(inputData, userId) {
 
   console.log(`[VerifyEmail] Best: ${best.email} — ${best.status} (${best.score})`);
 
-  // ── 1 credit deduct ───────────────────────────────────────────────────────
   if (orgId) {
     try {
       await supabase.rpc("deduct_credits", { p_org_id: orgId, p_amount: 1 });
@@ -154,20 +149,13 @@ export async function runVerifyEmail(inputData, userId) {
     }
   }
 
-  // ── Update lead in Supabase ───────────────────────────────────────────────
   if (leadId) {
     if (best.status === "invalid") {
-      // ── Invalid email → dump to garbage, notify user ─────────────────────
-      console.log(`[VerifyEmail] Email invalid → dumping lead ${leadId} to garbage`);
+      console.log(`[VerifyEmail] Invalid → garbage: ${leadId}`);
 
-      // Fetch lead data for snapshot
       const { data: leadData } = await supabase
-        .from("leads")
-        .select("*")
-        .eq("id", leadId)
-        .single();
+        .from("leads").select("*").eq("id", leadId).single();
 
-      // Dump to garbage_bin
       await supabase.from("garbage_bin").insert({
         org_id:       orgId || leadData?.org_id,
         user_id:      userId,
@@ -179,18 +167,13 @@ export async function runVerifyEmail(inputData, userId) {
         expires_at:   new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
       });
 
-      // Update lead status to 'invalid_email' so UI can hide/flag it
-      await supabase
-        .from("leads")
-        .update({
-          email_verified: "invalid",
-          email_score:    best.score,
-          status:         "invalid_email",
-          updated_at:     new Date().toISOString(),
-        })
-        .eq("id", leadId);
+      await supabase.from("leads").update({
+        email_verified: "invalid",
+        email_score:    best.score,
+        status:         "invalid_email",
+        updated_at:     new Date().toISOString(),
+      }).eq("id", leadId);
 
-      // Notify user
       try {
         await supabase.from("notifications").insert({
           user_id: userId,
@@ -200,19 +183,15 @@ export async function runVerifyEmail(inputData, userId) {
           data:    { leadId, email: best.email, score: best.score },
           read:    false,
         });
-      } catch { /* notifications table optional */ }
+      } catch {}
 
     } else {
-      // ── Valid/risky email → update lead with verified status ──────────────
-      await supabase
-        .from("leads")
-        .update({
-          email:          best.valid ? best.email : undefined,
-          email_verified: best.status,    // 'valid' | 'risky' | 'unknown'
-          email_score:    best.score,
-          updated_at:     new Date().toISOString(),
-        })
-        .eq("id", leadId);
+      await supabase.from("leads").update({
+        email:          best.valid ? best.email : undefined,
+        email_verified: best.status,
+        email_score:    best.score,
+        updated_at:     new Date().toISOString(),
+      }).eq("id", leadId);
     }
   }
 

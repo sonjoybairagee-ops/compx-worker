@@ -1,25 +1,26 @@
 /**
- * CompX Worker — src/jobs/enrichJob.js
- * Website enrichment job using Crawlee + network interception
+ * CompX Worker — src/jobs/enrichJob.js (FIXED)
  *
- * Apollo.io method:
- * 1. Crawl website + contact/about pages
- * 2. Intercept network requests for API data
- * 3. Extract emails, phones, social links, tech stack
- * 4. AI summarize company description
- * 5. Store enriched data back to Supabase
+ * Fixes applied:
+ *   1. Puppeteer stealth plugin — bot detection bypass
+ *   2. sourceType "discover" misleading parameter সরানো হয়েছে
  */
 
-import { PuppeteerCrawler, CheerioCrawler, Configuration, ProxyConfiguration } from "crawlee";
+import { CheerioCrawler, Configuration, ProxyConfiguration } from "crawlee";
+import { PuppeteerCrawler } from "crawlee";
+import puppeteer from "puppeteer-extra";
+import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import { supabase } from "../config/supabase.js";
 
-// Contact page paths to try
+// FIX 1: Stealth plugin register করুন
+// এটা না থাকলে Cloudflare / bot detection সহ যেকোনো site block করে
+puppeteer.use(StealthPlugin());
+
 const CONTACT_PATHS = [
   "/contact", "/contact-us", "/contacts", "/about", "/about-us",
   "/team", "/our-team", "/people", "/reach-us", "/support", "/company",
 ];
 
-// Junk email filter
 const JUNK_DOMAINS = new Set([
   "example.com","sentry.io","wixpress.com","w3.org","schema.org",
   "2x.png","1x.png","amazonaws.com","cloudfront.net",
@@ -39,19 +40,15 @@ function isJunkEmail(email) {
 }
 
 const EMAIL_REGEX = /([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})/g;
-
 function extractEmails(text) {
   return [...new Set((text.match(EMAIL_REGEX) || [])
-    .map(e => e.toLowerCase())
-    .filter(e => !isJunkEmail(e))
-  )];
+    .map(e => e.toLowerCase()).filter(e => !isJunkEmail(e)))];
 }
 
 function extractPhones(text) {
   const PHONE_REGEX = /(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}|\+\d{1,3}[-.\s]?\d{4,14}/g;
   return [...new Set((text.match(PHONE_REGEX) || [])
-    .filter(p => p.replace(/\D/g, "").length >= 7)
-  )].slice(0, 5);
+    .filter(p => p.replace(/\D/g, "").length >= 7))].slice(0, 5);
 }
 
 function extractSocials(html) {
@@ -72,21 +69,23 @@ function extractSocials(html) {
 
 function detectTechStack(html) {
   const checks = [
-    ["WordPress",   () => html.includes("/wp-content/")],
-    ["Shopify",     () => html.includes("cdn.shopify.com")],
-    ["Webflow",     () => html.includes("webflow.io")],
-    ["Squarespace", () => html.includes("squarespace.com")],
-    ["Wix",         () => html.includes("wix.com")],
-    ["HubSpot",     () => html.includes("hs-scripts.com") || html.includes("hubspot.com")],
-    ["Intercom",    () => html.includes("widget.intercom.io")],
-    ["Zendesk",     () => html.includes("zendesk.com")],
-    ["Stripe",      () => html.includes("js.stripe.com")],
-    ["Salesforce",  () => html.includes("salesforce.com")],
-    ["Next.js",     () => html.includes("__NEXT_DATA__")],
-    ["React",       () => html.includes("react") && html.includes("__reactFiber")],
+    ["WordPress",        () => html.includes("/wp-content/")],
+    ["Shopify",          () => html.includes("cdn.shopify.com")],
+    ["Webflow",          () => html.includes("webflow.io")],
+    ["Squarespace",      () => html.includes("squarespace.com")],
+    ["Wix",              () => html.includes("wix.com")],
+    ["HubSpot",          () => html.includes("hs-scripts.com") || html.includes("hubspot.com")],
+    ["Intercom",         () => html.includes("widget.intercom.io")],
+    ["Zendesk",          () => html.includes("zendesk.com")],
+    ["Stripe",           () => html.includes("js.stripe.com")],
+    ["Salesforce",       () => html.includes("salesforce.com")],
+    ["Next.js",          () => html.includes("__NEXT_DATA__")],
+    ["React",            () => html.includes("react") && html.includes("__reactFiber")],
     ["Google Analytics", () => html.includes("google-analytics.com") || html.includes("gtag")],
   ];
-  return checks.filter(([, fn]) => { try { return fn(); } catch { return false; } }).map(([n]) => n);
+  return checks
+    .filter(([, fn]) => { try { return fn(); } catch { return false; } })
+    .map(([n]) => n);
 }
 
 function extractSchemaOrg(html) {
@@ -104,7 +103,8 @@ function extractSchemaOrg(html) {
             email:       item.email || "",
             phone:       item.telephone || "",
             address:     item.address
-              ? [item.address.streetAddress, item.address.addressLocality, item.address.addressRegion].filter(Boolean).join(", ")
+              ? [item.address.streetAddress, item.address.addressLocality, item.address.addressRegion]
+                  .filter(Boolean).join(", ")
               : "",
             socials: item.sameAs || [],
           };
@@ -117,6 +117,8 @@ function extractSchemaOrg(html) {
 
 // ── Main enrichment job ───────────────────────────────────────────────────────
 export async function runEnrichJob(inputData, userId) {
+  // FIX 2: sourceType "discover" parameter সরানো হয়েছে
+  // pipelineFilterJob.js নিজেই promote করে — এখানে insert করার দরকার নেই
   const { website, name, leadId, hints = {}, proxyUrl } = inputData;
 
   if (!website) {
@@ -124,98 +126,84 @@ export async function runEnrichJob(inputData, userId) {
     return null;
   }
 
-  const domain = website.replace(/^https?:\/\//, "").replace(/^www\./, "").split("/")[0];
-  const isHttp = website.startsWith("http://");
+  const domain  = website.replace(/^https?:\/\//, "").replace(/^www\./, "").split("/")[0];
+  const isHttp  = website.startsWith("http://");
   const baseUrl = `${isHttp ? "http" : "https"}://${domain}`;
 
-  console.log(`[EnrichJob] Enriching: ${domain} (using ${baseUrl})`);
+  console.log(`[EnrichJob] Enriching: ${domain}`);
 
   const result = {
     domain,
-    emails:      [],
-    work_email:  null,
-    personal_email: null,
-    phones:      [],
-    socials:     {},
-    social_links: {},
-    techStack:   [],
-    description: "",
-    schema:      {},
-    crawledPages: [],
-    // Badges
-    phone_found: false,
-    linkedin_matched: false,
-    crm_ready:   false,
-    enrichedAt:  new Date().toISOString(),
+    emails: [], work_email: null, personal_email: null,
+    phones: [], socials: {}, social_links: {}, techStack: [],
+    description: "", schema: {}, crawledPages: [],
+    phone_found: false, linkedin_matched: false, crm_ready: false,
+    enrichedAt: new Date().toISOString(),
   };
 
-  // Pages to crawl
-  const urlsToCrawl = [baseUrl];
-  for (const path of CONTACT_PATHS.slice(0, 5)) {
-    urlsToCrawl.push(baseUrl + path);
-  }
-
+  const urlsToCrawl = [baseUrl, ...CONTACT_PATHS.slice(0, 5).map(p => baseUrl + p)];
   const allEmails = new Set();
   const allPhones = new Set();
-
-  // Proxy configuration
   const proxyConfiguration = proxyUrl ? new ProxyConfiguration({ proxyUrls: [proxyUrl] }) : undefined;
 
-  // ── Crawlee CheerioCrawler (Phase 1A: Fast HTML Scrape) ───────────────────
+  // ── Phase 1A: CheerioCrawler (fast) ──────────────────────────────────────
   let cheerioSuccess = false;
-  
   const cheerioCrawler = new CheerioCrawler({
     proxyConfiguration,
     maxRequestsPerCrawl: 6,
     maxConcurrency: 4,
     requestHandlerTimeoutSecs: 15,
     async requestHandler({ request, $, body }) {
-      const url = request.url;
+      const url  = request.url;
       const html = body.toString();
       const text = $("body").text();
 
       extractEmails(html + " " + text).forEach(e => allEmails.add(e));
       extractPhones(text).forEach(p => allPhones.add(p));
-
       $("a[href^='mailto:']").each((_, el) => {
         const e = $(el).attr("href")?.replace("mailto:", "").split("?")[0].toLowerCase();
         if (e && !isJunkEmail(e)) allEmails.add(e);
       });
 
       if (url === baseUrl || url === baseUrl + "/") {
-        result.techStack = detectTechStack(html);
-        result.socials   = extractSocials(html);
+        result.techStack   = detectTechStack(html);
+        result.socials     = extractSocials(html);
         result.social_links = result.socials;
-        result.schema    = extractSchemaOrg(html);
+        result.schema      = extractSchemaOrg(html);
         result.description = $('meta[name="description"], meta[property="og:description"]').attr("content") || "";
       }
 
       result.crawledPages.push(url);
-      console.log(`[EnrichJob] Cheerio crawled ${url} — emails: ${allEmails.size}`);
+      console.log(`[EnrichJob] Cheerio: ${url} — emails: ${allEmails.size}`);
       cheerioSuccess = true;
     },
     failedRequestHandler({ request, error }) {
-      console.warn(`[EnrichJob] Cheerio Failed: ${request.url} — ${error.message}`);
+      console.warn(`[EnrichJob] Cheerio failed: ${request.url} — ${error.message}`);
     },
   }, new Configuration({ persistStorage: false }));
 
-  try {
-    await cheerioCrawler.run(urlsToCrawl);
-  } catch (err) {
-    console.error("[EnrichJob] Cheerio error:", err.message);
-  }
+  try { await cheerioCrawler.run(urlsToCrawl); }
+  catch (err) { console.error("[EnrichJob] Cheerio error:", err.message); }
 
-  // ── Crawlee PuppeteerCrawler (Phase 1B: SPA Fallback) ─────────────────────
+  // ── Phase 1B: PuppeteerCrawler + Stealth (SPA fallback) ─────────────────
   if (allEmails.size === 0 || !cheerioSuccess) {
-    console.log(`[EnrichJob] Cheerio found no data or failed. Falling back to Puppeteer...`);
+    console.log("[EnrichJob] Falling back to Puppeteer (stealth mode)...");
+
     const puppeteerCrawler = new PuppeteerCrawler({
       proxyConfiguration,
       maxRequestsPerCrawl: 6,
       maxConcurrency: 2,
       requestHandlerTimeoutSecs: 25,
       launchContext: {
+        // FIX 1: puppeteer-extra with stealth ব্যবহার করুন
+        launcher: puppeteer,
         launchOptions: {
           ignoreHTTPSErrors: true,
+          args: [
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-blink-features=AutomationControlled",
+          ],
         },
       },
       preNavigationHooks: [
@@ -251,9 +239,9 @@ export async function runEnrichJob(inputData, userId) {
         mailtos.filter(e => !isJunkEmail(e)).forEach(e => allEmails.add(e));
 
         if (url === baseUrl || url === baseUrl + "/") {
-          if (!result.techStack.length) result.techStack = detectTechStack(html);
+          if (!result.techStack.length)              result.techStack = detectTechStack(html);
           if (!Object.keys(result.socials).length) { result.socials = extractSocials(html); result.social_links = result.socials; }
-          if (!Object.keys(result.schema).length) result.schema = extractSchemaOrg(html);
+          if (!Object.keys(result.schema).length)   result.schema = extractSchemaOrg(html);
           if (!result.description) {
             result.description = await page.$eval(
               'meta[name="description"], meta[property="og:description"]',
@@ -261,49 +249,45 @@ export async function runEnrichJob(inputData, userId) {
             ).catch(() => "");
           }
         }
+
         if (!result.crawledPages.includes(url)) result.crawledPages.push(url);
-        console.log(`[EnrichJob] Puppeteer crawled ${url} — emails: ${allEmails.size}`);
+        console.log(`[EnrichJob] Puppeteer: ${url} — emails: ${allEmails.size}`);
         if (allEmails.size >= 3 && url !== baseUrl) return;
       },
       failedRequestHandler({ request, error }) {
-        console.warn(`[EnrichJob] Puppeteer Failed: ${request.url} — ${error.message}`);
+        console.warn(`[EnrichJob] Puppeteer failed: ${request.url} — ${error.message}`);
       },
     }, new Configuration({ persistStorage: false }));
 
-    try {
-      await puppeteerCrawler.run(urlsToCrawl);
-    } catch (err) {
-      console.error("[EnrichJob] Puppeteer Crawler error:", err.message);
-    }
+    try { await puppeteerCrawler.run(urlsToCrawl); }
+    catch (err) { console.error("[EnrichJob] Puppeteer error:", err.message); }
   }
 
-  // ── Phase 2: Email Discovery & Classification ─────────────────────────────
+  // ── Phase 2: Email classification ────────────────────────────────────────
   result.emails = [...allEmails].slice(0, 8);
   if (result.schema.email && !isJunkEmail(result.schema.email)) {
     result.emails.unshift(result.schema.email);
     result.emails = [...new Set(result.emails)];
   }
 
-  const workEmails = result.emails.filter(e => e.endsWith(`@${domain}`));
-  const personalEmails = result.emails.filter(e => !e.endsWith(`@${domain}`) && !e.startsWith("info") && !e.startsWith("contact") && !e.startsWith("support") && !e.startsWith("sales"));
-  
-  result.work_email = workEmails[0] || null;
+  const workEmails     = result.emails.filter(e => e.endsWith(`@${domain}`));
+  const personalEmails = result.emails.filter(e =>
+    !e.endsWith(`@${domain}`) &&
+    !["info","contact","support","sales"].some(p => e.startsWith(p))
+  );
+
+  result.work_email     = workEmails[0]     || null;
   result.personal_email = personalEmails[0] || null;
 
-  // ── Phase 3: Phone Lookup ────────────────────────────────────────────────
-  result.phones = [...allPhones].slice(0, 5);
-  const finalPhone = result.schema.phone || result.phones[0] || null;
+  result.phones      = [...allPhones].slice(0, 5);
+  const finalPhone   = result.schema.phone || result.phones[0] || null;
   if (finalPhone) result.phone_found = true;
 
-  // ── Phase 4: Social Profiles ─────────────────────────────────────────────
   if (result.socials.linkedin) result.linkedin_matched = true;
 
-  // ── Phase 5: Contact Details ─────────────────────────────────────────────
   const finalDescription = result.schema.description || result.description || null;
-  const companyName = result.schema.name || name || null;
+  const companyName      = result.schema.name || name || null;
 
-  // ── Phase 6: Badge Assignment & CRM Readiness ────────────────────────────
-  // CRM ready if it has at least a work email, company name, and either phone or linkedin
   if (result.work_email && companyName && (result.phone_found || result.linkedin_matched)) {
     result.crm_ready = true;
   }
@@ -320,76 +304,17 @@ export async function runEnrichJob(inputData, userId) {
     social_links:     result.socials || {},
     phone_found:      result.phone_found,
     linkedin_matched: result.linkedin_matched,
-    crm_ready:        result.crm_ready
+    crm_ready:        result.crm_ready,
   };
 
-  // [DISABLED] sourceType === "discover" insert block removed — pipelineFilterJob already
-  // handles promote_to_lead, so inserting here caused duplicate leads in leads_verified.
-  // if (inputData.sourceType === "discover") {
-  //   let leadScore = 0;
-  //   if (inputData.website || website) leadScore += 20;
-  //   if (updateData.phone || inputData.phone) leadScore += 30;
-  //   if (result.emails.length > 0) leadScore += 40;
-  //   if (result.linkedin_matched) leadScore += 10;
-  //   if (inputData.hiring_signal) leadScore += 10;
-  //
-  //   const isQualified = leadScore >= 40;
-  //
-  //   if (isQualified) {
-  //     // It's CRM ready -> Insert into leads table directly!
-  //     const orgId = inputData.orgId || userId;
-  //
-  //     const newLead = {
-  //       org_id: orgId,
-  //       source: inputData.source || "google maps discover",
-  //       company: companyName || inputData.company || inputData.name,
-  //       name: inputData.name,
-  //       phone: updateData.phone || inputData.phone || null,
-  //       email: updateData.email || inputData.email || null,
-  //       emails: result.emails.length > 0 ? result.emails : (inputData.email ? [inputData.email] : []),
-  //       work_email: result.work_email || null,
-  //       personal_email: result.personal_email || null,
-  //       website: inputData.website || website || null,
-  //       industry: inputData.industry || null,
-  //       score: leadScore,
-  //       lead_score: leadScore,
-  //       hiring_signal: inputData.hiring_signal || false,
-  //       linkedin_url: result.socials.linkedin || null,
-  //       social_links: result.socials || {},
-  //       phone_found: result.phone_found,
-  //       linkedin_matched: result.linkedin_matched,
-  //       crm_ready: result.crm_ready,
-  //       description: finalDescription || null,
-  //       created_at: new Date().toISOString(),
-  //       metadata: {
-  //         enriched: true,
-  //         socials: result.socials,
-  //         techStack: result.techStack
-  //       }
-  //     };
-  //
-  //     await supabase.from("leads_verified").insert(newLead);
-  //     console.log(`[EnrichJob] Inserted qualified lead into leads table: ${newLead.company}`);
-  //
-  //     if (inputData.discovered_lead_id) {
-  //       await supabase.from("discovered_leads").update({ status: 'enriched' }).eq('id', inputData.discovered_lead_id);
-  //     }
-  //   } else {
-  //     console.log(`[EnrichJob] Lead score too low (${leadScore}). Kept in staging.`);
-  //     if (inputData.discovered_lead_id) {
-  //       await supabase.from("discovered_leads").update({ status: 'failed' }).eq('id', inputData.discovered_lead_id);
-  //     }
-  //   }
-  // } else
   if (leadId && (result.emails.length > 0 || result.phone_found || result.linkedin_matched)) {
-    // It came from extension -> Update existing extension_database row
     await supabase
       .from("extension_database")
       .update(updateData)
       .eq("hash", leadId)
       .eq("user_id", userId);
-      
-    console.log(`[EnrichJob] Updated lead ${leadId} with badges (CRM Ready: ${result.crm_ready})`);
+
+    console.log(`[EnrichJob] Updated lead ${leadId} (CRM Ready: ${result.crm_ready})`);
   }
 
   return result;

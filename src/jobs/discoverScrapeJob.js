@@ -6,6 +6,7 @@
 
 import FirecrawlApp from "@mendable/firecrawl-js";
 import { supabase } from "../config/supabase.js";
+import { createLogger } from "../lib/terminalLogger.js";
 import { saveToDatabaseLeads } from "./pipelineSave.js";
 
 const firecrawl = new FirecrawlApp({ apiKey: process.env.FIRECRAWL_API_KEY || "dummy_key_for_dev_mode" });
@@ -22,13 +23,59 @@ async function logToTerminal(jobId, message) {
 }
 
 // ── Credit Deduction ──────────────────────────────────────────────────────────
-async function deductUserCredits(userId, amount) {
-  const { data, error } = await supabase.rpc("deduct_credits_atomic", {
-    user_id: userId,
-    amount: amount
+/** Per-lead platform search cost (must match src/lib/credits/discoverCosts.ts) */
+const PLATFORM_SCRAPE_COST = {
+  google_maps: 3,
+  linkedin: 5,
+  youtube: 5,
+  instagram: 4,
+  instagram_biz: 4,
+  websites: 3,
+  startup_db: 5,
+};
+
+/** Enrichment add-ons (must match src/lib/credits/discoverCosts.ts) */
+const ENRICHMENT_SCRAPE_COST = {
+  website: 2,
+  email: 3,
+  tech: 1,
+  ai: 1,
+};
+
+/** Apollo API surcharge when lookup runs (must match discoverCosts.ts APOLLO_LOOKUP_COST) */
+const APOLLO_LOOKUP_COST = 5;
+
+async function deductUserCredits(userId, amount, orgId) {
+  const { error } = await supabase.rpc("deduct_credits", {
+    p_user_id: userId,
+    p_org_id: orgId || userId,
+    p_amount: amount,
   });
-  if (error || !data) throw new Error("INSUFFICIENT_CREDITS");
-  return data;
+  if (error) throw new Error("INSUFFICIENT_CREDITS");
+}
+
+async function tryDeductUserCredits(userId, amount, orgId, reason, type) {
+  try {
+    await deductUserCredits(userId, amount, orgId);
+    await logCreditTransaction(userId, orgId, -amount, reason, type);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function logCreditTransaction(userId, orgId, amount, reason, type, leadName) {
+  try {
+    await supabase.from("credit_transactions").insert({
+      user_id: userId,
+      amount,
+      reason,
+      type,
+      lead_id: null,
+    });
+  } catch (e) {
+    console.warn("[DiscoverScrape] credit_transactions log failed:", e.message);
+  }
 }
 
 // ── Pattern Email Prediction ──────────────────────────────────────────────────
@@ -118,7 +165,7 @@ const SERPER_KEY  = () => process.env.SERPER_API_KEY;
 const SERPAPI_KEY = () => process.env.SERPAPI_KEY || process.env.SERPAPI_API_KEY;
 
 // ── Serper.dev helper (primary) ───────────────────────────────────────────────
-async function serperSearch(type, query, num = 10) {
+async function serperSearch(type, query, num = 10, page = 1) {
   const key = SERPER_KEY();
   if (!key) return null;
 
@@ -133,11 +180,33 @@ async function serperSearch(type, query, num = 10) {
   const res  = await fetch(endpoint, {
     method:  "POST",
     headers: { "X-API-KEY": key, "Content-Type": "application/json" },
-    body:    JSON.stringify({ q: query, num }),
+    body:    JSON.stringify({ q: query, num, page }),
   });
   const json = await res.json();
   if (json.error) return null;
   return json;
+}
+
+/** Paginated Serper Maps — fetches up to maxResults (multiple pages if needed) */
+async function serperMapsPaginated(query, maxResults, jobId) {
+  const all = [];
+  const maxPages = Math.ceil(maxResults / 20);
+
+  for (let page = 1; page <= maxPages && all.length < maxResults; page++) {
+    const need = Math.min(100, maxResults - all.length);
+    const data = await serperSearch("google_maps", query, need, page);
+    const places = data?.places || [];
+    await logToTerminal(jobId, `Serper maps page ${page}: ${places.length} results`);
+    if (!places.length) break;
+    all.push(...places);
+    if (places.length < need) break; // no more pages available
+  }
+
+  return all.slice(0, maxResults);
+}
+
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -146,18 +215,38 @@ async function serperSearch(type, query, num = 10) {
 
 // ── 1. Google Maps Source ────────────────────────────────────────────────────
 async function searchGoogleMaps(keyword, location, maxResults, jobId) {
-  // Primary: Google Maps API
+  const query = location ? `${keyword} in ${location}` : keyword;
+
+  // Primary: Google Maps Places API (paginated — 20 results/page, up to 60 total)
   const gmKey = process.env.GOOGLE_MAPS_API_KEY;
   if (gmKey) {
     try {
-      const query = location ? `${keyword} in ${location}` : keyword;
-      const url = `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(query)}&key=${gmKey}`;
-      const res  = await fetch(url);
-      const json = await res.json();
+      const allPlaces = [];
+      let nextPageToken = null;
+      let pageNum = 0;
 
-      if (json.status !== "REQUEST_DENIED" && json.status !== "OVER_QUERY_LIMIT" && json.results?.length > 0) {
-        await logToTerminal(jobId, `Google Maps API: ${json.results.length} results ✅`);
-        const results = json.results.slice(0, maxResults).map(place => ({
+      while (allPlaces.length < maxResults && pageNum < 5) {
+        let url = `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(query)}&key=${gmKey}`;
+        if (nextPageToken) url += `&pagetoken=${encodeURIComponent(nextPageToken)}`;
+
+        const res  = await fetch(url);
+        const json = await res.json();
+
+        if (json.status === "REQUEST_DENIED" || json.status === "OVER_QUERY_LIMIT") break;
+        if (!json.results?.length) break;
+
+        allPlaces.push(...json.results);
+        pageNum++;
+        await logToTerminal(jobId, `Google Maps API page ${pageNum}: ${json.results.length} (total ${allPlaces.length})`);
+
+        nextPageToken = json.next_page_token || null;
+        if (!nextPageToken || allPlaces.length >= maxResults) break;
+        // Google requires ~2s delay before using next_page_token
+        await sleep(2100);
+      }
+
+      if (allPlaces.length > 0) {
+        const results = allPlaces.slice(0, maxResults).map(place => ({
           id: `map_${place.place_id}`, name: place.name,
           address: place.formatted_address, rating: place.rating?.toString() || "",
           industry: place.types?.[0]?.replace(/_/g, " ") || "",
@@ -180,21 +269,17 @@ async function searchGoogleMaps(keyword, location, maxResults, jobId) {
     }
   }
 
-  // Primary: Serper.dev google_maps
-  const query = location ? `${keyword} in ${location}` : keyword;
-  await logToTerminal(jobId, `Trying Serper.dev (google_maps)...`);
-  const serperData = await serperSearch("google_maps", query, maxResults);
-  if (serperData) {
-    const places = serperData.places || [];
-    await logToTerminal(jobId, `Serper.dev google_maps: ${places.length} results ✅`);
-    if (places.length > 0) {
-      return places.slice(0, maxResults).map(p => ({
-        id: `serper_${p.cid || Math.random()}`, name: p.title || "",
-        address: p.address || "", rating: p.rating?.toString() || "",
-        industry: p.category || keyword || "", website: p.website || null,
-        phone: p.phoneNumber || null, email: null, linkedin: null, source: "google_maps",
-      })).filter(r => r.name);
-    }
+  // Serper.dev google_maps (paginated)
+  await logToTerminal(jobId, `Trying Serper.dev (google_maps, target: ${maxResults})...`);
+  const serperPlaces = await serperMapsPaginated(query, maxResults, jobId);
+  if (serperPlaces.length > 0) {
+    await logToTerminal(jobId, `Serper.dev google_maps: ${serperPlaces.length} total ✅`);
+    return serperPlaces.map(p => ({
+      id: `serper_${p.cid || Math.random()}`, name: p.title || "",
+      address: p.address || "", rating: p.rating?.toString() || "",
+      industry: p.category || keyword || "", website: p.website || null,
+      phone: p.phoneNumber || null, email: null, linkedin: null, source: "google_maps",
+    })).filter(r => r.name);
   }
 
   // Fallback: SerpAPI google_maps engine
@@ -872,6 +957,7 @@ async function getEmailFromApollo(companyName, domain, jobId) {
 // ════════════════════════════════════════════════════════════════════════════
 export async function runDiscoverScrape(inputData, userId, job, proxy) {
   const jobId = job.id;
+  const logger = createLogger(jobId);
   const {
     keyword,
     location,
@@ -879,9 +965,10 @@ export async function runDiscoverScrape(inputData, userId, job, proxy) {
     source      = "google_maps",
     enrichments = {},
     linkedinFilters = null,
+    orgId       = null,
   } = inputData;
 
-  await logToTerminal(jobId, `Starting: "${keyword}" in "${location}" [source: ${source}]`);
+  await logger.log(`Starting: "${keyword}" in "${location}" [source: ${source}]`);
 
   // ── Step 1: Platform Source routing ─────────────────────────────────────────
   let results = [];
@@ -901,89 +988,154 @@ export async function runDiscoverScrape(inputData, userId, job, proxy) {
     results = await searchGoogleMaps(keyword, location, maxResults, jobId);
   }
 
-  await logToTerminal(jobId, `Found ${results.length} results from [${source}]`);
+  await logger.log(`Found ${results.length} results from [${source}]`);
 
   if (results.length === 0) {
-    await logToTerminal(jobId, `No results found`);
+    await logger.log(`No results found`);
+    await logger.close();
     return { count: 0, leads: [] };
   }
 
-  // ── Step 2: Enrichment ───────────────────────────────────────────────────────
-  await logToTerminal(jobId, `Starting enrichment [website:${!!enrichments.website}, email:${!!enrichments.email}]...`);
+  // ── Step 2: Optional enrichment (never stops early — all leads are saved) ───
+  await logger.log(`Starting enrichment [website:${!!enrichments.website}, email:${!!enrichments.email}] for ${results.length} leads...`);
 
   const processedLeads = [];
   let totalCreditsSpent = 0;
-  let metrics = { emailsFound: 0, patternPredicted: 0, apolloUsed: 0, skipped: 0 };
+  let metrics = { emailsFound: 0, patternPredicted: 0, apolloUsed: 0, enrichSkipped: 0, scrapeSkipped: 0 };
+
+  const platformBaseCost = PLATFORM_SCRAPE_COST[source] || PLATFORM_SCRAPE_COST[source === "instagram" ? "instagram_biz" : source] || 3;
 
   for (const lead of results) {
     let costForLead = 0;
 
-    // Base credit deduction
+    // Platform scrape cost (YouTube=5, Instagram=4, etc.)
     try {
-      await deductUserCredits(userId, 1);
-      costForLead += 1;
+      await deductUserCredits(userId, platformBaseCost, orgId);
+      costForLead += platformBaseCost;
+      await logCreditTransaction(
+        userId,
+        orgId,
+        -platformBaseCost,
+        `${source} scrape: ${lead.name || lead.company}`,
+        source === "youtube" ? "youtube_scrape" : source === "instagram" || source === "instagram_biz" ? "instagram_scrape" : "scrape",
+        lead.name
+      );
     } catch (e) {
-      await logToTerminal(jobId, `[STOP] Insufficient credits for ${lead.name}`);
-      metrics.skipped++;
-      break;
+      metrics.scrapeSkipped++;
+      await logger.log(`[SKIP] ${source} scrape credits (${platformBaseCost}) — no balance for ${lead.name}`);
+      continue;
     }
 
-    // Website Enrichment (Firecrawl multi-page)
+    // Website enrichment — 2 credits when enabled (discoverCosts.ts)
     if (lead.website && enrichments.website) {
-      try {
-        await deductUserCredits(userId, 2);
-        costForLead += 2;
-        const enriched = await enrichWebsite(lead.website, jobId);
-        if (!lead.email && enriched.email) { lead.email = enriched.email; metrics.emailsFound++; }
-        lead.isHiring = enriched.isHiring || false;
-        lead.linkedin = lead.linkedin || enriched.linkedin || null;
-        lead.twitter  = enriched.twitter || null;
-        lead.metaDescription = enriched.metaDescription || null;
-      } catch (e) {
-        await logToTerminal(jobId, `[SKIP] Firecrawl credits insufficient for ${lead.name}`);
+      const websiteCost = ENRICHMENT_SCRAPE_COST.website;
+      const charged = await tryDeductUserCredits(
+        userId,
+        websiteCost,
+        orgId,
+        `Website enrich: ${lead.name || lead.company}`,
+        "website_enrichment"
+      );
+      if (charged) {
+        costForLead += websiteCost;
+        try {
+          const enriched = await enrichWebsite(lead.website, jobId);
+          if (!lead.email && enriched.email) { lead.email = enriched.email; metrics.emailsFound++; }
+          lead.isHiring = enriched.isHiring || false;
+          lead.linkedin = lead.linkedin || enriched.linkedin || null;
+          lead.twitter  = enriched.twitter || null;
+          lead.metaDescription = enriched.metaDescription || null;
+        } catch (e) {
+          metrics.enrichSkipped++;
+          await logger.log(`[SKIP] Website enrich failed for ${lead.name} (lead still saved)`);
+        }
+      } else {
+        metrics.enrichSkipped++;
+        await logger.log(`[SKIP] Website enrich credits (${websiteCost}) — no balance for ${lead.name}`);
       }
     }
 
-    // Email Discovery (Apollo → Pattern fallback) — also for LinkedIn phone
+    // Email discovery — 3 credits base; +5 when Apollo lookup runs
     if ((!lead.email && enrichments.email) || (enrichments.phone && !lead.phone)) {
       const domain = lead.website
         ? (() => { try { return new URL(lead.website).hostname.replace("www.", ""); } catch { return null; } })()
         : null;
 
       const lookupName = lead.contactName || lead.name;
+      let emailEnrichReady = !!lead.email || !enrichments.email;
 
-      try {
-        if (!lead.email && enrichments.email) {
-          await deductUserCredits(userId, 3);
-          costForLead += 3;
+      if (!lead.email && enrichments.email) {
+        const emailCost = ENRICHMENT_SCRAPE_COST.email;
+        const charged = await tryDeductUserCredits(
+          userId,
+          emailCost,
+          orgId,
+          `Email enrich: ${lead.name || lead.company}`,
+          "email_enrichment"
+        );
+        if (charged) {
+          costForLead += emailCost;
+          emailEnrichReady = true;
+        } else {
+          metrics.enrichSkipped++;
+          await logger.log(`[SKIP] Email enrich credits (${emailCost}) — no balance for ${lead.name}`);
         }
-        const apolloData = await getEmailFromApollo(lookupName, domain, jobId);
-        if (apolloData) {
-          lead.email        = apolloData.email        || lead.email;
-          lead.phone        = apolloData.phone        || lead.phone;
-          lead.linkedin     = apolloData.linkedin     || lead.linkedin;
-          lead.contactName  = apolloData.contactName  || lead.contactName;
-          lead.contactTitle = apolloData.contactTitle || lead.contactTitle;
-          if (apolloData.email) { metrics.apolloUsed++; metrics.emailsFound++; }
-        } else if (!lead.email && enrichments.email) {
-          lead.email = predictEmail(lead.name, lead.website);
-          if (lead.email) metrics.patternPredicted++;
-        }
-      } catch (e) {
-        if (!lead.email && enrichments.email) {
-          try {
-            await deductUserCredits(userId, 1);
-            costForLead += 1;
+      }
+
+      if (emailEnrichReady || (enrichments.phone && !lead.phone)) {
+        try {
+          let apolloData = null;
+          const hasApolloKey = !!process.env.APOLLO_API_KEY;
+
+          if (hasApolloKey) {
+            const apolloCharged = await tryDeductUserCredits(
+              userId,
+              APOLLO_LOOKUP_COST,
+              orgId,
+              `Apollo lookup: ${lead.name || lead.company}`,
+              "apollo_lookup"
+            );
+
+            if (apolloCharged) {
+              costForLead += APOLLO_LOOKUP_COST;
+              apolloData = await getEmailFromApollo(lookupName, domain, jobId);
+            } else {
+              await logger.log(`[SKIP] Apollo credits (${APOLLO_LOOKUP_COST}) — pattern fallback for ${lead.name}`);
+            }
+          }
+
+          if (apolloData) {
+            lead.email        = apolloData.email        || lead.email;
+            lead.phone        = apolloData.phone        || lead.phone;
+            lead.linkedin     = apolloData.linkedin     || lead.linkedin;
+            lead.contactName  = apolloData.contactName  || lead.contactName;
+            lead.contactTitle = apolloData.contactTitle || lead.contactTitle;
+            if (apolloData.email) { metrics.apolloUsed++; metrics.emailsFound++; }
+          } else if (!lead.email && enrichments.email && emailEnrichReady) {
             lead.email = predictEmail(lead.name, lead.website);
             if (lead.email) metrics.patternPredicted++;
-            await logToTerminal(jobId, `[LOW CREDITS] Pattern engine used for ${lead.name}`);
-          } catch { await logToTerminal(jobId, `[SKIP] Email discovery skipped for ${lead.name}`); }
+          }
+        } catch (e) {
+          if (!lead.email && enrichments.email && emailEnrichReady) {
+            try {
+              lead.email = predictEmail(lead.name, lead.website);
+              if (lead.email) {
+                metrics.patternPredicted++;
+                await logger.log(`[FALLBACK] Pattern engine used for ${lead.name}`);
+              }
+            } catch {
+              metrics.enrichSkipped++;
+              await logger.log(`[SKIP] Email discovery skipped for ${lead.name} (lead still saved)`);
+            }
+          } else {
+            metrics.enrichSkipped++;
+          }
         }
       }
     }
 
     lead.score = calcScore(lead);
-    await logToTerminal(jobId, `✓ ${lead.name} — email: ${lead.email || "none"}, score: ${lead.score}`);
+    await logger.log(`✓ ${lead.name} — email: ${lead.email || "none"}, score: ${lead.score}`);
     processedLeads.push(lead);
     totalCreditsSpent += costForLead;
 
@@ -1004,17 +1156,24 @@ export async function runDiscoverScrape(inputData, userId, job, proxy) {
   }
 
   // ── Step 3: DB save ───────────────────────────────────────────────────────────
-  await logToTerminal(jobId, `Saving ${processedLeads.length} leads...`);
+  await logger.log(`Saving ${processedLeads.length} leads...`);
 
   if (processedLeads.length > 0) {
     try {
-      await saveToDatabaseLeads(processedLeads, userId, inputData.orgId, source);
+      await saveToDatabaseLeads(processedLeads, userId, orgId || inputData.orgId, source);
     } catch (error) {
-      await logToTerminal(jobId, `[ERROR] DB save failed: ${error.message}`);
+      await logger.log(`[ERROR] DB save failed: ${error.message}`);
       throw error;
     }
   }
 
-  await logToTerminal(jobId, `✅ Job complete — ${processedLeads.length} leads saved`);
-  return { count: processedLeads.length, leads: processedLeads };
+  await logger.log(`✅ Job complete — ${processedLeads.length}/${results.length} leads saved (${metrics.scrapeSkipped} skipped: no scrape credits, ${metrics.enrichSkipped} enrich skipped)`);
+  await logger.close();
+  return {
+    count: processedLeads.length,
+    searched: results.length,
+    leads: processedLeads,
+    metrics,
+  };
 }
+

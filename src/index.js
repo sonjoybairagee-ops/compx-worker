@@ -62,9 +62,23 @@ export const dripQueue = new Queue("drip-jobs", { connection: redis });
 
 
 // ── Job dispatcher ────────────────────────────────────────────────────────────
+const SCRAPE_JOB_NAMES = new Set([
+  "discover_scrape",
+  "google-maps-scrape",
+  "linkedin-scrape",
+  "instagram-biz-scrape",
+  "youtube-scrape",
+  "websites-scrape",
+  "startup-db-scrape",
+]);
+
 async function processJob(job) {
-  const { input_data, user_id } = job.data;
-  const type = job.data.type || job.name; // Fallback to job.name if job.data.type is undefined
+  const { input_data, user_id, billing_user_id } = job.data;
+  const billingUserId = billing_user_id || user_id;
+  let type = job.data.type || job.name;
+
+  // Normalize platform-specific job names → discover_scrape
+  if (SCRAPE_JOB_NAMES.has(type)) type = "discover_scrape";
 
   // ── Routing decision ──────────────────────────────────────
   const routingCtx = {
@@ -96,7 +110,7 @@ async function processJob(job) {
         result = await runEnrichJob(input_data, user_id, proxy);
         break;
       case "discover_scrape":
-        result = await runDiscoverScrape(input_data, user_id, job, proxy);
+        result = await runDiscoverScrape(input_data, billingUserId, job, proxy);
         break;
       case "hiring_signals":
         result = await runHiringSignals(input_data, user_id, job);
@@ -108,7 +122,7 @@ async function processJob(job) {
         result = await runWebhookJob(input_data);
         break;
       case "pipeline_filter":
-        result = await runPipelineFilter(input_data, user_id);
+        result = await runPipelineFilter(input_data, billing_user_id || user_id);
         break;
       default:
         throw new Error(`Unknown job type: ${type}`);
