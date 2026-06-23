@@ -76,3 +76,4 @@ export function pollSupabaseJobs(queue, supabase) {
   poll(); // immediate first run
   console.log(`[Poller] Started — polling every ${POLL_INTERVAL / 1000}s`);
 }
+
