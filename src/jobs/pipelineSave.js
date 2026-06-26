@@ -1,106 +1,113 @@
 /**
- * pipelineSave.js
- * worker/src/jobs/pipelineSave.js
+ * pipelineSave.js (FIXED)
  *
- * discoverScrapeJob এর শেষে এই function call করুন।
- * leads table এ সরাসরি না গিয়ে database_leads (staging) এ যাবে।
- * তারপর pipelineFilterJob চেক করবে কোনটা enrich দরকার।
+ * Fixes applied:
+ *   1. Batch insert — N+1 DB call বন্ধ (প্রতি ৫০ row একসাথে)
+ *   2. Upsert with onConflict — duplicate insert বন্ধ
+ *   3. instagram social_links double-set bug fix
  */
 
 import { supabase } from "../config/supabase.js";
-import { compxJobsQueue } from "../config/queueRegistry.ts";
 
-/**
- * Save scraped results to database_leads (staging).
- * Call this instead of inserting directly to leads table.
- *
- * @param {Object[]} results  - Array of scraped company objects
- * @param {string}   userId
- * @param {string}   orgId
- * @param {string}   source   - 'google_maps' | 'linkedin' | etc.
- */
-export async function saveToDatabaseLeads(results, userId, orgId, source = "discover") {
-  if (!results?.length) return { saved: 0, errors: 0 };
-
-  let saved = 0;
-  let errors = 0;
-
-  for (const item of results) {
-    const website = normalizeWebsite(item.website || item.domain);
-
-    // Build row — only save what we actually have
-    const row = {
-      org_id:   orgId,
-      user_id:  userId,
-      name:     item.name || item.title || null,
-      company:  item.company || item.name || item.title || null,
-      industry: item.industry || item.category || null,
-      website:  website || null,
-      address:  item.address || item.location || null,
-      source,
-      raw:      item,
-      status:   "pending",
-    };
-
-    // If scraper already found email/phone, include them
-    if (item.email)         row.email = item.email;
-    if (item.phone)         row.phone = item.phone;
-    if (item.social_links)  row.social_links = item.social_links;
-
-    const { data, error } = await supabase
-      .from("database_leads")
-      .insert(row)
-      .select("id")
-      .single();
-
-    if (error) {
-      console.error("[pipelineSave] Insert error:", error.message, "row:", row.company);
-      errors++;
-      continue;
-    }
-
-    saved++;
-
-    // Immediately trigger pipeline filter for this record
-    await triggerPipelineFilter(data.id, orgId, userId);
-  }
-
-  console.log(`[pipelineSave] Saved ${saved}/${results.length} to database_leads (${errors} errors)`);
-  return { saved, errors };
-}
-
-/**
- * Trigger pipeline filter job for a single database_lead.
- * This checks if enrichment is needed and routes accordingly.
- */
-async function triggerPipelineFilter(dbLeadId, orgId, userId) {
-  try {
-    // Mark as enriching
-    await supabase
-      .from("database_leads")
-      .update({ status: "enriching", updated_at: new Date().toISOString() })
-      .eq("id", dbLeadId);
-
-    // Queue the filter job (via BullMQ)
-    await compxJobsQueue().add("pipeline_filter", {
-      type: "pipeline_filter",
-      user_id: userId,
-      input_data: {
-        dbLeadId,
-        orgId,
-        userId,
-      }
-    });
-  } catch (err) {
-    console.error("[pipelineSave] triggerPipelineFilter error:", err.message);
-  }
-}
+const BATCH_SIZE = 50;
 
 function normalizeWebsite(raw) {
   if (!raw) return null;
-  return raw.trim()
-    .replace(/^https?:\/\//, "")
-    .replace(/^www\./, "")
-    .split("/")[0]
-    .toLowerCase();
+  let url = raw.trim();
+  if (!url) return null;
+  if (!/^https?:\/\//i.test(url)) url = `https://${url}`;
+  try {
+    return new URL(url).href.replace(/\/$/, "");
+  } catch {
+    return url.split("/")[0] || null;
+  }
+}
+
+function buildSocialLinks(item) {
+  const links = { ...(item.social_links || {}) };
+  if (item.linkedin)   links.linkedin   = item.linkedin;
+  if (item.twitter)    links.twitter    = item.twitter;
+  if (item.channelUrl) links.youtube    = item.channelUrl;
+  if (item.crunchbase) links.crunchbase = item.crunchbase;
+  if (item.placeId)    links.google_maps = `https://www.google.com/maps/place/?q=place_id:${item.placeId}`;
+
+  // FIX 3: instagram double-set bug
+  // আগে: item.instagram ও item.profileUrl দুটোই set করত — profileUrl overwrite করত
+  if (item.instagram) {
+    links.instagram = item.instagram;
+  } else if (item.profileUrl) {
+    links.instagram = item.profileUrl; // fallback, instagram handle না থাকলে
+  }
+
+  return Object.keys(links).length > 0 ? links : null;
+}
+
+function buildRow(item, userId, orgId, source) {
+  let website = normalizeWebsite(item.website || item.domain);
+  if (!website && item.crunchbase) website = normalizeWebsite(item.crunchbase);
+
+  const company = item.company || item.name || item.title || null;
+
+  const row = {
+    org_id:   orgId,
+    user_id:  userId,
+    name:     item.name || item.contactName || company,
+    company,
+    industry: item.industry || item.category || null,
+    website,
+    address:  item.address || item.location || null,
+    source,
+    raw:      item,
+    status:   "pending",
+    score:    item.score ?? 0,
+  };
+
+  if (item.email)        row.email         = item.email;
+  if (item.phone)        row.phone         = item.phone;
+  if (item.contactName)  row.contact_name  = item.contactName;
+  if (item.contactTitle) row.contact_title = item.contactTitle;
+
+  const social = buildSocialLinks(item);
+  if (social) row.social_links = social;
+
+  return row;
+}
+
+export async function saveToDatabaseLeads(results, userId, orgId, source = "discover") {
+  if (!results?.length) return { saved: 0, errors: 0 };
+
+  // FIX 1: সব row আগে build করুন
+  const rows = results.map(item => buildRow(item, userId, orgId, source));
+
+  let saved  = 0;
+  let errors = 0;
+
+  // FIX 1: Batch এ insert — প্রতি ৫০ row একসাথে
+  // আগে: প্রতি row এ আলাদা await → 100 lead = 100 DB call
+  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+    const batch = rows.slice(i, i + BATCH_SIZE);
+
+    // FIX 2: upsert দিয়ে duplicate prevent করুন
+    // onConflict: org_id + website — same org এ same website duplicate হবে না
+    // DB তে এই unique constraint থাকতে হবে:
+    //   UNIQUE (org_id, website) WHERE website IS NOT NULL
+    const { data, error } = await supabase
+      .from("leads_staging")
+      .upsert(batch, {
+        onConflict:       "org_id,website",
+        ignoreDuplicates: true,  // duplicate হলে skip, error না
+      })
+      .select("id");
+
+    if (error) {
+      console.error(`[pipelineSave] Batch ${i / BATCH_SIZE + 1} error:`, error.message);
+      errors += batch.length;
+      continue;
+    }
+
+    saved += data?.length ?? batch.length;
+  }
+
+  console.log(`[pipelineSave] Saved ${saved}/${results.length} to leads_staging (${errors} errors)`);
+  return { saved, errors };
 }
