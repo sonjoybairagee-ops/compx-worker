@@ -10,12 +10,29 @@
  */
 
 import { CheerioCrawler, Configuration, ProxyConfiguration } from "crawlee";
-import { PuppeteerCrawler } from "crawlee";
-import puppeteer from "puppeteer-extra";
-import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import { supabase } from "../config/supabase.js";
 
-puppeteer.use(StealthPlugin());
+// PuppeteerCrawler + puppeteer-extra — optional, Render এ নেই
+// Cheerio + Hunter chain দিয়ে বেশিরভাগ email পাওয়া যায়
+// Puppeteer দরকার হলে local dev এ চালাও
+let PuppeteerCrawler = null;
+let puppeteerExtra   = null;
+
+async function loadPuppeteer() {
+  if (PuppeteerCrawler) return true;
+  try {
+    const crawlee   = await import("crawlee");
+    const pe        = await import("puppeteer-extra");
+    const stealth   = await import("puppeteer-extra-plugin-stealth");
+    PuppeteerCrawler = crawlee.PuppeteerCrawler;
+    puppeteerExtra   = pe.default;
+    puppeteerExtra.use(stealth.default());
+    return true;
+  } catch {
+    console.log("[EnrichJob] puppeteer-extra not available — Cheerio+Hunter only mode");
+    return false;
+  }
+}
 
 // ── Rate limiting — একই domain এ বারবার hit হবে না ──────────────────────────
 const recentDomains = new Map(); // domain → last scraped timestamp
@@ -270,6 +287,10 @@ export async function runEnrichJob(inputData, userId) {
 
   // ── Phase 1B: PuppeteerCrawler + Stealth (JS-heavy site fallback) ────────
   if (allEmails.size === 0 || !cheerioSuccess) {
+    const puppeteerAvailable = await loadPuppeteer();
+    if (!puppeteerAvailable) {
+      console.log("[EnrichJob] Puppeteer not available — skipping to Hunter.io");
+    } else {
     console.log("[EnrichJob] Falling back to Puppeteer (stealth mode)...");
 
     const puppeteerCrawler = new PuppeteerCrawler({
@@ -279,7 +300,7 @@ export async function runEnrichJob(inputData, userId) {
       requestHandlerTimeoutSecs: 25,
 
       launchContext: {
-        launcher: puppeteer,
+        launcher: puppeteerExtra,
         launchOptions: {
           ignoreHTTPSErrors: true,
           args: [
@@ -359,6 +380,7 @@ export async function runEnrichJob(inputData, userId) {
 
     try { await puppeteerCrawler.run(urlsToCrawl); }
     catch (err) { console.error("[EnrichJob] Puppeteer error:", err.message); }
+    } // end puppeteerAvailable
   }
 
   // ── Phase 1C: Hunter.io fallback — Crawlee email না পেলে ────────────────
