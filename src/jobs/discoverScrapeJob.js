@@ -556,74 +556,123 @@ async function searchYouTube(keyword, location, maxResults, jobId, enrichments =
     await logToTerminal(jobId, `[ERROR] YOUTUBE_API_KEY not set`);
     return [];
   }
- 
-  // ── Step 1: YouTube Data API v3 — channel search (100 quota units) ─────────
-  await logToTerminal(jobId, `YouTube API search: "${keyword}" ${location || ""}...`);
- 
+
+  // ── Step 1: YouTube Data API v3 — channel search ─────────────────────────
+  // Location keyword হিসেবে যোগ করো — YouTube API তে location filter নেই
+  const searchQuery = location ? `${keyword} ${location}` : keyword;
+  await logToTerminal(jobId, `YouTube API search: "${searchQuery}"...`);
+
   const searchUrl = new URL("https://www.googleapis.com/youtube/v3/search");
   searchUrl.searchParams.set("part", "snippet");
-  searchUrl.searchParams.set("q", location ? `${keyword} ${location}` : keyword);
+  searchUrl.searchParams.set("q", searchQuery);
   searchUrl.searchParams.set("type", "channel");
-  searchUrl.searchParams.set("maxResults", String(Math.min(maxResults, 50)));
+  searchUrl.searchParams.set("maxResults", String(Math.min(maxResults * 2, 50))); // 2x fetch, filter later
+  searchUrl.searchParams.set("relevanceLanguage", "en"); // English-first results
   searchUrl.searchParams.set("key", apiKey);
- 
+
   const searchRes  = await fetch(searchUrl.toString());
   const searchJson = await searchRes.json();
- 
+
   if (searchJson.error) {
     await logToTerminal(jobId, `YouTube search error: ${searchJson.error.message}`);
     return [];
   }
- 
+
   const items = searchJson.items || [];
   if (items.length === 0) {
     await logToTerminal(jobId, `YouTube: no channels found`);
     return [];
   }
   await logToTerminal(jobId, `YouTube: ${items.length} channels found ✅`);
- 
-  // ── Step 2: YouTube Data API v3 — bulk channel details (1 quota unit) ──────
+
+  // ── Step 2: YouTube Data API v3 — bulk channel details ──────────────────
   const channelIds = items.map(i => i.snippet.channelId).join(",");
   const detailUrl  = new URL("https://www.googleapis.com/youtube/v3/channels");
-  detailUrl.searchParams.set("part", "snippet,statistics");
+  detailUrl.searchParams.set("part", "snippet,statistics,brandingSettings,contentDetails");
   detailUrl.searchParams.set("id", channelIds);
   detailUrl.searchParams.set("key", apiKey);
- 
+
   const detailRes  = await fetch(detailUrl.toString());
   const detailJson = await detailRes.json();
- 
+
   if (detailJson.error) {
     await logToTerminal(jobId, `YouTube details error: ${detailJson.error.message}`);
     return [];
   }
- 
-  const channels = detailJson.items || [];
+
+  let channels = detailJson.items || [];
   await logToTerminal(jobId, `YouTube: details fetched for ${channels.length} channels`);
- 
-  // Build lead objects — same shape as other sources
-  // YouTube-specific fields go into `raw` automatically via pipelineSave
-  const results = channels.map(ch => ({
-    id:              `yt_${ch.id}`,
-    name:            ch.snippet?.title || "",
-    company:         ch.snippet?.title || "",
-    industry:        keyword,
-    address:         location || ch.snippet?.country || "",
-    rating:          "",
-    website:         null,
-    phone:           null,
-    email:           null,
-    linkedin:        null,
-    source:          "youtube",
-    // YouTube-specific (saved to `raw` column in leads_staging)
-    channelId:       ch.id,
-    channelUrl:      `https://www.youtube.com/channel/${ch.id}`,
-    subscriberCount: ch.statistics?.subscriberCount  || "0",
-    videoCount:      ch.statistics?.videoCount       || "0",
-    viewCount:       ch.statistics?.viewCount        || "0",
-    joinedDate:      ch.snippet?.publishedAt         || null,
-    description:     ch.snippet?.description         || "",
-    country:         ch.snippet?.country             || null,
-  }));
+
+  // ── Step 3: Quality filter — business channels only ───────────────────────
+  channels = channels.filter(ch => {
+    const subs     = parseInt(ch.statistics?.subscriberCount || "0");
+    const videos   = parseInt(ch.statistics?.videoCount || "0");
+    const desc     = (ch.snippet?.description || "").toLowerCase();
+    const hasWebsite = !!(ch.brandingSettings?.channel?.unsubscribedTrailer ||
+                          ch.snippet?.description?.match(/https?:\/\//));
+
+    // Filter out:
+    // 1. Channels with < 100 subscribers (too small, not a business)
+    // 2. Channels with 0 videos
+    // 3. Personal hobby channels (no business keywords in description)
+    if (subs < 100) return false;
+    if (videos === 0) return false;
+
+    // Business signal — description এ contact/business keyword আছে কিনা
+    const businessSignals = ["contact", "business", "email", "call", "service",
+      "hire", "book", "order", "shop", "buy", "whatsapp", "dm", "enquiry",
+      "agency", "studio", "clinic", "school", "academy", "company", "ltd"];
+    const hasBusinessSignal = businessSignals.some(s => desc.includes(s));
+
+    // 500+ subscribers হলে business signal ছাড়াও allow করো
+    if (subs >= 500) return true;
+    return hasBusinessSignal;
+  });
+
+  // maxResults limit
+  channels = channels.slice(0, maxResults);
+
+  await logToTerminal(jobId, `YouTube: ${channels.length} business channels after filter ✅`);
+
+  // Build lead objects
+  const results = channels.map(ch => {
+    const subs = parseInt(ch.statistics?.subscriberCount || "0");
+
+    // Website link — description থেকে extract করো
+    const descLinks = (ch.snippet?.description || "").match(/https?:\/\/[^\s]+/g) || [];
+    const websiteFromDesc = descLinks.find(l =>
+      !l.includes("youtube.com") && !l.includes("google.com") &&
+      !l.includes("instagram.com") && !l.includes("twitter.com") &&
+      !l.includes("facebook.com") && !l.includes("tiktok.com")
+    ) || null;
+
+    return {
+      id:              `yt_${ch.id}`,
+      name:            ch.snippet?.title || "",
+      company:         ch.snippet?.title || "",
+      industry:        keyword,
+      address:         location || ch.snippet?.country || "",
+      rating:          "",
+      website:         websiteFromDesc, // description থেকে website
+      phone:           null,
+      email:           null,
+      linkedin:        null,
+      source:          "youtube",
+      channelId:       ch.id,
+      channelUrl:      `https://www.youtube.com/channel/${ch.id}`,
+      subscriberCount: ch.statistics?.subscriberCount  || "0",
+      videoCount:      ch.statistics?.videoCount       || "0",
+      viewCount:       ch.statistics?.viewCount        || "0",
+      joinedDate:      ch.snippet?.publishedAt         || null,
+      description:     ch.snippet?.description         || "",
+      country:         ch.snippet?.country             || null,
+      // Quality metrics
+      _subCount:       subs,
+    };
+  });
+
+  // Sort by subscriber count (bigger = more established business)
+  results.sort((a, b) => (b._subCount || 0) - (a._subCount || 0));
  
   // ── Step 3: Playwright scrape About page (email enrichment enabled হলে) ────
   // enrichments.email === true হলেই scrape করবে — quota বাঁচাতে

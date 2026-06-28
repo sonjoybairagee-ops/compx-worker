@@ -1,17 +1,17 @@
 /**
- * pipelineFilterJob.js (FIXED)
+ * CompX — pipelineFilterJob.js
  *
- * Fixes applied:
- *   1. Duplicate email check — leads_verified তে আগে আছে কিনা দেখে
- *   2. enrich_attempts max limit (3) — infinite retry বন্ধ
- *   3. Webhook fallback সরিয়ে direct promote — silent staging stuck বন্ধ
- *   4. org_id null fallback — garbage_bin orphan record বন্ধ
- *   5. sourceType "discover" misleading parameter সরানো
+ * CHANGES (startup-optimized):
+ *   1. enrichJob এর নতুন return values handle — hunterUsed, patternPredicted, techStack
+ *   2. Pattern predicted email দিয়েও promote হবে (আগে শুধু real email এ হত)
+ *   3. tech_stack DB update এ যোগ হয়েছে
+ *   4. social_links আরো ভালোভাবে merge হচ্ছে
+ *   5. enrichAndDecide এ linkedin আলাদাভাবে save হচ্ছে
  */
 
-import { supabase } from "../config/supabase.js";
-import { buildVerifiedLeadRow } from "../lib/promoteLead.js";
-import { runEnrichJob } from "./enrichJob.js";
+import { supabase }              from "../config/supabase.js";
+import { buildVerifiedLeadRow }  from "../lib/promoteLead.js";
+import { runEnrichJob }          from "./enrichJob.js";
 
 const MAX_ENRICH_ATTEMPTS = 3;
 
@@ -32,7 +32,7 @@ export async function runPipelineFilter(inputData, userId) {
 
   console.log(`[PipelineFilter] Processing: ${dbLead.company || dbLead.name} (${dbLeadId})`);
 
-  // FIX 2: Max attempts check — এর বেশি হলে garbage তে পাঠাও
+  // Max attempts → garbage
   if ((dbLead.enrich_attempts || 0) >= MAX_ENRICH_ATTEMPTS) {
     console.log(`[PipelineFilter] Max attempts (${MAX_ENRICH_ATTEMPTS}) reached → garbage`);
     return await dumpToGarbage(dbLead, orgId, userId, "max_attempts_reached");
@@ -75,7 +75,6 @@ async function enrichAndDecide(dbLead, userId, orgId) {
       {
         website:  dbLead.website,
         domain:   dbLead.website,
-        // FIX 5: sourceType "discover" সরানো — enrichJob এ duplicate insert করত
         orgId:    orgId || dbLead.org_id,
         company:  dbLead.company || dbLead.name,
         name:     dbLead.name,
@@ -90,15 +89,48 @@ async function enrichAndDecide(dbLead, userId, orgId) {
     console.error("[PipelineFilter] enrichJob threw:", err.message);
   }
 
+  // ── enrichJob 의 새 return values 처리 ────────────────────────────────────
   const email       = enrichResult?.work_email || enrichResult?.emails?.[0] || null;
   const phone       = enrichResult?.phones?.[0] || null;
-  const socialLinks = enrichResult?.social_links || {};
+  const techStack   = enrichResult?.techStack   || [];
+  const hunterUsed  = enrichResult?.hunterUsed  || false;
+  const patternPredicted = enrichResult?.patternPredicted || false;
+
+  // social_links — enrichResult 의 socials 와 기존 데이터 merge
+  const socialLinks = {
+    ...(dbLead.social_links || {}),
+    ...(enrichResult?.social_links || {}),
+    ...(enrichResult?.socials      || {}),
+  };
+
+  // LinkedIn 따로 추출
+  const linkedin = enrichResult?.socials?.linkedin
+    || enrichResult?.social_links?.linkedin
+    || socialLinks?.linkedin
+    || null;
+
+  console.log(
+    `[PipelineFilter] Enrich result: email=${email || "none"}` +
+    ` phone=${phone || "none"}` +
+    ` hunter=${hunterUsed}` +
+    ` pattern=${patternPredicted}` +
+    ` tech=${techStack.join(",") || "none"}`
+  );
 
   if (!email) {
-    console.log(`[PipelineFilter] No email found → keeping in staging (attempt ${attempts}/${MAX_ENRICH_ATTEMPTS})`);
+    // email নেই — staging এ রাখো, পাওয়া data save করো
+    console.log(`[PipelineFilter] No email found → staging (attempt ${attempts}/${MAX_ENRICH_ATTEMPTS})`);
+
     await supabase
       .from("leads_staging")
-      .update({ status: "failed", phone: phone || dbLead.phone, social_links: socialLinks, updated_at: new Date().toISOString() })
+      .update({
+        status:       "failed",
+        phone:        phone        || dbLead.phone,
+        social_links: socialLinks,
+        tech_stack:   techStack,   // নতুন — আগে missing ছিল
+        linkedin_url: linkedin     || dbLead.linkedin_url || null,
+        updated_at:   new Date().toISOString(),
+      })
       .eq("id", dbLead.id);
 
     await supabase
@@ -109,13 +141,23 @@ async function enrichAndDecide(dbLead, userId, orgId) {
     return { kept: true, reason: "no_email_but_has_website", attempt: attempts };
   }
 
-  // FIX 3: Webhook dependency সরানো — এখানেই directly promote করো
-  // আগে: status="enriched" করে webhook এর উপর ছেড়ে দিত → silent stuck হত
+  // Email পেয়েছি — promote করো
+  // pattern predicted email দিয়েও promote হবে (পরে verify করা যাবে)
+  if (patternPredicted) {
+    console.log(`[PipelineFilter] Pattern predicted email: ${email} — promoting with low confidence`);
+  }
+  if (hunterUsed) {
+    console.log(`[PipelineFilter] Hunter.io email: ${email} — promoting`);
+  }
+
   const enrichedLead = {
     ...dbLead,
     email,
-    phone:        phone || dbLead.phone,
-    social_links: socialLinks,
+    phone:            phone        || dbLead.phone,
+    social_links:     socialLinks,
+    tech_stack:       techStack,
+    linkedin_url:     linkedin     || dbLead.linkedin_url || null,
+    email_source:     patternPredicted ? "pattern" : hunterUsed ? "hunter" : "scrape",
   };
 
   await supabase
@@ -123,7 +165,7 @@ async function enrichAndDecide(dbLead, userId, orgId) {
     .update({ status: "completed", updated_at: new Date().toISOString() })
     .eq("staging_id", dbLead.id);
 
-  console.log(`[PipelineFilter] Enriched — promoting directly (no webhook dependency)`);
+  console.log(`[PipelineFilter] Enriched — promoting directly`);
   return await promoteToLeads(enrichedLead, orgId);
 }
 
@@ -131,17 +173,17 @@ async function enrichAndDecide(dbLead, userId, orgId) {
 async function promoteToLeads(dbLead, orgId) {
   const resolvedOrgId = orgId || dbLead.org_id;
 
-  // FIX 1: Duplicate check — same email + org এ আগে আছে কিনা
+  // Duplicate check — same email + org
   if (dbLead.email) {
     const { data: existing } = await supabase
       .from("leads_verified")
       .select("id")
-      .eq("email", dbLead.email)
+      .eq("email",  dbLead.email)
       .eq("org_id", resolvedOrgId)
       .maybeSingle();
 
     if (existing) {
-      console.log(`[PipelineFilter] Duplicate email ${dbLead.email} → marking as duplicate`);
+      console.log(`[PipelineFilter] Duplicate email ${dbLead.email} → marking duplicate`);
       await supabase
         .from("leads_staging")
         .update({ status: "duplicate", updated_at: new Date().toISOString() })
@@ -150,9 +192,11 @@ async function promoteToLeads(dbLead, orgId) {
     }
   }
 
+  const verifiedRow = buildVerifiedLeadRow({ ...dbLead, org_id: resolvedOrgId });
+
   const { error: insertErr } = await supabase
     .from("leads_verified")
-    .insert(buildVerifiedLeadRow({ ...dbLead, org_id: resolvedOrgId }));
+    .insert(verifiedRow);
 
   if (insertErr) {
     console.error("[PipelineFilter] leads_verified insert error:", insertErr.message);
@@ -164,13 +208,12 @@ async function promoteToLeads(dbLead, orgId) {
     .update({ status: "promoted", updated_at: new Date().toISOString() })
     .eq("id", dbLead.id);
 
-  console.log(`[PipelineFilter] Promoted ${dbLead.id} → leads_verified`);
-  return { promoted: true, leadId: dbLead.id };
+  console.log(`[PipelineFilter] ✅ Promoted ${dbLead.id} → leads_verified (source: ${dbLead.email_source || "direct"})`);
+  return { promoted: true, leadId: dbLead.id, emailSource: dbLead.email_source };
 }
 
 // ── Garbage bin ───────────────────────────────────────────────────────────────
 async function dumpToGarbage(dbLead, orgId, userId, reason) {
-  // FIX 4: org_id null fallback — garbage record orphan বন্ধ
   const resolvedOrgId = orgId || dbLead.org_id || userId;
 
   const { error } = await supabase
@@ -199,7 +242,7 @@ async function dumpToGarbage(dbLead, orgId, userId, reason) {
   return { dumped: true, reason };
 }
 
-// ── Notify ────────────────────────────────────────────────────────────────────
+// ── Notify user ───────────────────────────────────────────────────────────────
 async function notifyUser(userId, dbLead, reason) {
   const messages = {
     no_data:              `"${dbLead.company || dbLead.name}" has no website or email — moved to garbage.`,
