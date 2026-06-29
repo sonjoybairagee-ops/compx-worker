@@ -11,32 +11,55 @@ import { supabase } from "../config/supabase.js";
 
 const BATCH_SIZE = 50;
 
+const SOCIAL_DOMAINS = [
+  "facebook.com", "instagram.com", "twitter.com", "x.com",
+  "linkedin.com", "youtube.com", "tiktok.com", "pinterest.com",
+  "snapchat.com", "threads.net", "t.me", "wa.me",
+];
+
 function normalizeWebsite(raw) {
   if (!raw) return null;
   let url = raw.trim();
   if (!url) return null;
   if (!/^https?:\/\//i.test(url)) url = `https://${url}`;
   try {
-    return new URL(url).href.replace(/\/$/, "");
+    const parsed = new URL(url);
+    // Social media URL কে website হিসেবে save করবো না
+    const isSocial = SOCIAL_DOMAINS.some(d => parsed.hostname.includes(d));
+    if (isSocial) return null;
+    return parsed.href.replace(/\/$/, "");
   } catch {
-    return url.split("/")[0] || null;
+    return null;
   }
 }
 
 function buildSocialLinks(item) {
   const links = { ...(item.social_links || {}) };
-  if (item.linkedin)   links.linkedin   = item.linkedin;
-  if (item.twitter)    links.twitter    = item.twitter;
-  if (item.channelUrl) links.youtube    = item.channelUrl;
-  if (item.crunchbase) links.crunchbase = item.crunchbase;
-  if (item.placeId)    links.google_maps = `https://www.google.com/maps/place/?q=place_id:${item.placeId}`;
 
-  // FIX 3: instagram double-set bug
-  // আগে: item.instagram ও item.profileUrl দুটোই set করত — profileUrl overwrite করত
+  if (item.linkedin)    links.linkedin    = item.linkedin;
+  if (item.twitter)     links.twitter     = item.twitter;
+  if (item.channelUrl)  links.youtube     = item.channelUrl;
+  if (item.crunchbase)  links.crunchbase  = item.crunchbase;
+  if (item.facebook)    links.facebook    = item.facebook;
+  if (item.tiktok)      links.tiktok      = item.tiktok;
+
+  // Google Maps
+  if (item.placeId) {
+    links.google_maps = `https://www.google.com/maps/place/?q=place_id:${item.placeId}`;
+  }
+
+  // Instagram — handle বা profileUrl
   if (item.instagram) {
     links.instagram = item.instagram;
-  } else if (item.profileUrl) {
-    links.instagram = item.profileUrl; // fallback, instagram handle না থাকলে
+  } else if (item.profileUrl && !links.instagram) {
+    links.instagram = item.profileUrl;
+  }
+
+  // YouTube channel এ social links আসে (instagram, twitter)
+  if (item.source === "youtube") {
+    if (item.instagram && !links.instagram) links.instagram = item.instagram;
+    if (item.twitter   && !links.twitter)   links.twitter   = item.twitter;
+    if (item.facebook  && !links.facebook)  links.facebook  = item.facebook;
   }
 
   return Object.keys(links).length > 0 ? links : null;
@@ -66,6 +89,42 @@ function buildRow(item, userId, orgId, source) {
   if (item.phone)        row.phone         = item.phone;
   if (item.contactName)  row.contact_name  = item.contactName;
   if (item.contactTitle) row.contact_title = item.contactTitle;
+
+  // YouTube — raw column এ proper data দাও যাতে modal ঠিকমতো দেখায়
+  if (source === "youtube") {
+    row.meta_description = item.description || null;
+    row.followers_count  = item.subscriberCount ? parseInt(item.subscriberCount) : null;
+    row.raw = {
+      ...item,
+      // normalize field names — leadRawNormalize.ts এ এগুলো দিয়ে detect হয়
+      source:           "youtube",
+      channel_name:     item.channelName     || item.name    || null,
+      subscriber_count: item.subscriberCount || item.subscriber_count || "0",
+      total_video_count: item.videoCount     || item.total_video_count || "0",
+      view_count:       item.viewCount       || item.view_count || "0",
+      channel_created_at: item.joinedDate    || item.channel_created_at || null,
+      country:          item.country         || null,
+      description:      item.description     || null,
+      channelUrl:       item.channelUrl      || null,
+    };
+  }
+
+  // Instagram — raw column এ proper data
+  if (source === "instagram" || source === "instagram_biz") {
+    row.meta_description = item.bio || null;
+    row.followers_count  = item.followersCount || item.follower_count || null;
+    row.raw = {
+      ...item,
+      source:          source,
+      username:        item.username         || item.handle        || null,
+      follower_count:  item.followersCount   || item.follower_count || 0,
+      following_count: item.followsCount     || item.following_count || 0,
+      post_count:      item.postsCount       || item.post_count    || 0,
+      is_verified:     item.isVerified       || item.is_verified   || false,
+      account_type:    item.accountType      || item.account_type  || null,
+      bio:             item.bio              || null,
+    };
+  }
 
   const social = buildSocialLinks(item);
   if (social) row.social_links = social;

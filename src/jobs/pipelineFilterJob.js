@@ -1,17 +1,18 @@
 /**
  * CompX — pipelineFilterJob.js
  *
- * CHANGES (startup-optimized):
+ * CHANGES:
  *   1. enrichJob এর নতুন return values handle — hunterUsed, patternPredicted, techStack
- *   2. Pattern predicted email দিয়েও promote হবে (আগে শুধু real email এ হত)
+ *   2. Pattern predicted email দিয়েও promote হবে
  *   3. tech_stack DB update এ যোগ হয়েছে
  *   4. social_links আরো ভালোভাবে merge হচ্ছে
- *   5. enrichAndDecide এ linkedin আলাদাভাবে save হচ্ছে
+ *   5. FIX: enrichJob এ targetTable: null pass করা হচ্ছে
+ *          (DB write pipeline এ হয়, enrichJob এ না)
  */
 
-import { supabase }              from "../config/supabase.js";
-import { buildVerifiedLeadRow }  from "../lib/promoteLead.js";
-import { runEnrichJob }          from "./enrichJob.js";
+import { supabase }             from "../config/supabase.js";
+import { buildVerifiedLeadRow } from "../lib/promoteLead.js";
+import { runEnrichJob }         from "./enrichJob.js";
 
 const MAX_ENRICH_ATTEMPTS = 3;
 
@@ -32,25 +33,21 @@ export async function runPipelineFilter(inputData, userId) {
 
   console.log(`[PipelineFilter] Processing: ${dbLead.company || dbLead.name} (${dbLeadId})`);
 
-  // Max attempts → garbage
   if ((dbLead.enrich_attempts || 0) >= MAX_ENRICH_ATTEMPTS) {
     console.log(`[PipelineFilter] Max attempts (${MAX_ENRICH_ATTEMPTS}) reached → garbage`);
     return await dumpToGarbage(dbLead, orgId, userId, "max_attempts_reached");
   }
 
-  // Email আছে → duplicate check করে promote
   if (dbLead.email) {
     console.log(`[PipelineFilter] Has email → checking duplicate then promoting`);
     return await promoteToLeads(dbLead, orgId);
   }
 
-  // Website আছে → enrich
   if (dbLead.website) {
     console.log(`[PipelineFilter] Has website, no email → enriching`);
     return await enrichAndDecide(dbLead, billUser, orgId);
   }
 
-  // কিছু নেই → garbage
   console.log(`[PipelineFilter] No website, no email → garbage`);
   return await dumpToGarbage(dbLead, orgId, userId, "no_data");
 }
@@ -73,15 +70,11 @@ async function enrichAndDecide(dbLead, userId, orgId) {
   try {
     enrichResult = await runEnrichJob(
       {
-        website:  dbLead.website,
-        domain:   dbLead.website,
-        orgId:    orgId || dbLead.org_id,
-        company:  dbLead.company || dbLead.name,
-        name:     dbLead.name,
-        industry: dbLead.industry,
-        phone:    dbLead.phone,
-        address:  dbLead.address,
-        source:   dbLead.source,
+        website:     dbLead.website,
+        name:        dbLead.company || dbLead.name,
+        leadId:      null,          // Pipeline DB write এখানেই হয়, enrichJob এ না
+        targetTable: null,          // FIX: enrichJob এ DB write skip করো
+        proxyUrl:    process.env.PROXY_URL || null,
       },
       userId
     );
@@ -89,21 +82,18 @@ async function enrichAndDecide(dbLead, userId, orgId) {
     console.error("[PipelineFilter] enrichJob threw:", err.message);
   }
 
-  // ── enrichJob 의 새 return values 처리 ────────────────────────────────────
-  const email       = enrichResult?.work_email || enrichResult?.emails?.[0] || null;
-  const phone       = enrichResult?.phones?.[0] || null;
-  const techStack   = enrichResult?.techStack   || [];
-  const hunterUsed  = enrichResult?.hunterUsed  || false;
+  const email            = enrichResult?.work_email || enrichResult?.emails?.[0] || null;
+  const phone            = enrichResult?.phones?.[0] || null;
+  const techStack        = enrichResult?.techStack   || [];
+  const hunterUsed       = enrichResult?.hunterUsed  || false;
   const patternPredicted = enrichResult?.patternPredicted || false;
 
-  // social_links — enrichResult 의 socials 와 기존 데이터 merge
   const socialLinks = {
     ...(dbLead.social_links || {}),
     ...(enrichResult?.social_links || {}),
     ...(enrichResult?.socials      || {}),
   };
 
-  // LinkedIn 따로 추출
   const linkedin = enrichResult?.socials?.linkedin
     || enrichResult?.social_links?.linkedin
     || socialLinks?.linkedin
@@ -118,7 +108,6 @@ async function enrichAndDecide(dbLead, userId, orgId) {
   );
 
   if (!email) {
-    // email নেই — staging এ রাখো, পাওয়া data save করো
     console.log(`[PipelineFilter] No email found → staging (attempt ${attempts}/${MAX_ENRICH_ATTEMPTS})`);
 
     await supabase
@@ -127,7 +116,7 @@ async function enrichAndDecide(dbLead, userId, orgId) {
         status:       "failed",
         phone:        phone        || dbLead.phone,
         social_links: socialLinks,
-        tech_stack:   techStack,   // নতুন — আগে missing ছিল
+        tech_stack:   techStack,
         linkedin_url: linkedin     || dbLead.linkedin_url || null,
         updated_at:   new Date().toISOString(),
       })
@@ -141,8 +130,6 @@ async function enrichAndDecide(dbLead, userId, orgId) {
     return { kept: true, reason: "no_email_but_has_website", attempt: attempts };
   }
 
-  // Email পেয়েছি — promote করো
-  // pattern predicted email দিয়েও promote হবে (পরে verify করা যাবে)
   if (patternPredicted) {
     console.log(`[PipelineFilter] Pattern predicted email: ${email} — promoting with low confidence`);
   }
@@ -153,11 +140,11 @@ async function enrichAndDecide(dbLead, userId, orgId) {
   const enrichedLead = {
     ...dbLead,
     email,
-    phone:            phone        || dbLead.phone,
-    social_links:     socialLinks,
-    tech_stack:       techStack,
-    linkedin_url:     linkedin     || dbLead.linkedin_url || null,
-    email_source:     patternPredicted ? "pattern" : hunterUsed ? "hunter" : "scrape",
+    phone:        phone     || dbLead.phone,
+    social_links: socialLinks,
+    tech_stack:   techStack,
+    linkedin_url: linkedin  || dbLead.linkedin_url || null,
+    email_source: patternPredicted ? "pattern" : hunterUsed ? "hunter" : "scrape",
   };
 
   await supabase
@@ -173,7 +160,6 @@ async function enrichAndDecide(dbLead, userId, orgId) {
 async function promoteToLeads(dbLead, orgId) {
   const resolvedOrgId = orgId || dbLead.org_id;
 
-  // Duplicate check — same email + org
   if (dbLead.email) {
     const { data: existing } = await supabase
       .from("leads_verified")

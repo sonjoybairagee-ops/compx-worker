@@ -1,20 +1,20 @@
 /**
  * CompX Worker — src/jobs/enrichJob.js
  *
- * CHANGES (startup-optimized):
- *   1. Hunter.io fallback যোগ — Cheerio/Puppeteer email না পেলে Hunter চেষ্টা করে
+ * CHANGES:
+ *   1. Hunter.io fallback — Cheerio/Puppeteer email না পেলে Hunter চেষ্টা করে
  *   2. Pattern prediction fallback — Hunter ও না পেলে predict করে
- *   3. Rate limiting যোগ — একই domain বারবার hit হবে না
- *   4. techStack সবসময় result এ আসে (আগে Puppeteer path এ missing ছিল)
- *   5. crm_ready condition আরো relaxed — phone বা linkedin যেকোনো একটা হলেই হবে
+ *   3. Rate limiting — একই domain বারবার hit হবে না
+ *   4. techStack সবসময় result এ আসে
+ *   5. crm_ready condition relaxed — phone বা linkedin যেকোনো একটা হলেই হবে
+ *   6. FIX: Phase 4 এ leads_verified update করে (আগে extension_database ছিল — wrong)
+ *          targetTable param দিয়ে কোন table update হবে control করা যায়
  */
 
 import { CheerioCrawler, Configuration, ProxyConfiguration } from "crawlee";
 import { supabase } from "../config/supabase.js";
 
 // PuppeteerCrawler + puppeteer-extra — optional, Render এ নেই
-// Cheerio + Hunter chain দিয়ে বেশিরভাগ email পাওয়া যায়
-// Puppeteer দরকার হলে local dev এ চালাও
 let PuppeteerCrawler = null;
 let puppeteerExtra   = null;
 
@@ -34,9 +34,9 @@ async function loadPuppeteer() {
   }
 }
 
-// ── Rate limiting — একই domain এ বারবার hit হবে না ──────────────────────────
-const recentDomains = new Map(); // domain → last scraped timestamp
-const DOMAIN_COOLDOWN_MS = 60_000; // ১ মিনিটে একবারের বেশি না
+// ── Rate limiting ──────────────────────────────────────────────────────────────
+const recentDomains = new Map();
+const DOMAIN_COOLDOWN_MS = 60_000;
 
 function isDomainCooledDown(domain) {
   const last = recentDomains.get(domain);
@@ -46,7 +46,6 @@ function isDomainCooledDown(domain) {
 
 function markDomainScraped(domain) {
   recentDomains.set(domain, Date.now());
-  // Memory leak prevent — ১০০০+ domain জমলে পুরনো সরাও
   if (recentDomains.size > 1000) {
     const oldest = [...recentDomains.entries()]
       .sort((a, b) => a[1] - b[1])
@@ -156,7 +155,7 @@ function extractSchemaOrg(html) {
   return {};
 }
 
-// ── Pattern Email Prediction (last resort fallback) ───────────────────────────
+// ── Pattern Email Prediction (last resort) ────────────────────────────────────
 function predictEmail(name, domain) {
   if (!name || !domain) return null;
   const names = name.split(" ").map(n => n.toLowerCase().replace(/[^a-z]/g, "")).filter(Boolean);
@@ -176,7 +175,7 @@ function predictEmail(name, domain) {
   return patterns[0].email;
 }
 
-// ── Hunter.io email fallback (Apollo replace) ─────────────────────────────────
+// ── Hunter.io fallback ────────────────────────────────────────────────────────
 async function getEmailFromHunter(domain) {
   const apiKey = process.env.HUNTER_API_KEY;
   if (!apiKey) return null;
@@ -204,8 +203,23 @@ async function getEmailFromHunter(domain) {
 }
 
 // ── Main enrichment job ───────────────────────────────────────────────────────
+/**
+ * @param inputData.website    - website URL to enrich
+ * @param inputData.name       - company name (for pattern prediction)
+ * @param inputData.leadId     - row ID in targetTable to update after enrichment
+ * @param inputData.targetTable - which table to update: "leads_verified" | null (skip DB write)
+ *                               Pipeline flow: null (pipelineFilterJob handles DB write)
+ *                               Enrichment Hub flow: "leads_verified"
+ * @param inputData.proxyUrl   - optional proxy
+ */
 export async function runEnrichJob(inputData, userId) {
-  const { website, name, leadId, proxyUrl } = inputData;
+  const {
+    website,
+    name,
+    leadId,
+    targetTable = null,   // FIX: explicit — কোন table update হবে
+    proxyUrl,
+  } = inputData;
 
   if (!website) {
     console.warn("[EnrichJob] No website provided");
@@ -216,7 +230,6 @@ export async function runEnrichJob(inputData, userId) {
   const isHttp  = website.startsWith("http://");
   const baseUrl = `${isHttp ? "http" : "https"}://${domain}`;
 
-  // Rate limit check — একই domain সম্প্রতি scrape হয়েছে কিনা
   if (!isDomainCooledDown(domain)) {
     console.log(`[EnrichJob] Rate limit: ${domain} scraped recently, skipping`);
     return null;
@@ -235,18 +248,18 @@ export async function runEnrichJob(inputData, userId) {
     enrichedAt: new Date().toISOString(),
   };
 
-  const urlsToCrawl       = [baseUrl, ...CONTACT_PATHS.slice(0, 5).map(p => baseUrl + p)];
-  const allEmails         = new Set();
-  const allPhones         = new Set();
+  const urlsToCrawl        = [baseUrl, ...CONTACT_PATHS.slice(0, 5).map(p => baseUrl + p)];
+  const allEmails          = new Set();
+  const allPhones          = new Set();
   const proxyConfiguration = proxyUrl ? new ProxyConfiguration({ proxyUrls: [proxyUrl] }) : undefined;
 
-  // ── Phase 1A: CheerioCrawler (fast, $0 cost) ──────────────────────────────
+  // ── Phase 1A: CheerioCrawler ──────────────────────────────────────────────
   let cheerioSuccess = false;
 
   const cheerioCrawler = new CheerioCrawler({
     proxyConfiguration,
-    maxRequestsPerCrawl:      6,
-    maxConcurrency:           4,
+    maxRequestsPerCrawl:       6,
+    maxConcurrency:            4,
     requestHandlerTimeoutSecs: 15,
 
     async requestHandler({ request, $, body }) {
@@ -273,7 +286,6 @@ export async function runEnrichJob(inputData, userId) {
       console.log(`[EnrichJob] Cheerio: ${url} — emails: ${allEmails.size}`);
       cheerioSuccess = true;
 
-      // Email পেলে বাকি page skip করো — speed বাড়বে
       if (allEmails.size > 0 && url !== baseUrl) return;
     },
 
@@ -285,113 +297,105 @@ export async function runEnrichJob(inputData, userId) {
   try { await cheerioCrawler.run(urlsToCrawl); }
   catch (err) { console.error("[EnrichJob] Cheerio error:", err.message); }
 
-  // ── Phase 1B: PuppeteerCrawler + Stealth (JS-heavy site fallback) ────────
+  // ── Phase 1B: Puppeteer fallback ──────────────────────────────────────────
   if (allEmails.size === 0 || !cheerioSuccess) {
     const puppeteerAvailable = await loadPuppeteer();
     if (!puppeteerAvailable) {
       console.log("[EnrichJob] Puppeteer not available — skipping to Hunter.io");
     } else {
-    console.log("[EnrichJob] Falling back to Puppeteer (stealth mode)...");
+      console.log("[EnrichJob] Falling back to Puppeteer (stealth mode)...");
 
-    const puppeteerCrawler = new PuppeteerCrawler({
-      proxyConfiguration,
-      maxRequestsPerCrawl:      6,
-      maxConcurrency:           2,
-      requestHandlerTimeoutSecs: 25,
+      const puppeteerCrawler = new PuppeteerCrawler({
+        proxyConfiguration,
+        maxRequestsPerCrawl:       6,
+        maxConcurrency:            2,
+        requestHandlerTimeoutSecs: 25,
 
-      launchContext: {
-        launcher: puppeteerExtra,
-        launchOptions: {
-          ignoreHTTPSErrors: true,
-          args: [
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-blink-features=AutomationControlled",
-          ],
+        launchContext: {
+          launcher: puppeteerExtra,
+          launchOptions: {
+            ignoreHTTPSErrors: true,
+            args: [
+              "--no-sandbox",
+              "--disable-setuid-sandbox",
+              "--disable-blink-features=AutomationControlled",
+            ],
+          },
         },
-      },
 
-      preNavigationHooks: [
-        async ({ page }) => {
-          await page.setRequestInterception(true);
-          page.on("request", req => {
-            // image/font/media block করো — speed বাড়বে
-            if (["image","font","media","stylesheet"].includes(req.resourceType())) {
-              req.abort();
-            } else {
-              req.continue();
-            }
-          });
-          // JSON response থেকেও email খোঁজো (API-based sites)
-          page.on("response", async res => {
-            try {
-              const ct = res.headers()["content-type"] || "";
-              if (ct.includes("json") && res.status() === 200) {
-                const text = await res.text().catch(() => "");
-                extractEmails(text).forEach(e => allEmails.add(e));
+        preNavigationHooks: [
+          async ({ page }) => {
+            await page.setRequestInterception(true);
+            page.on("request", req => {
+              if (["image","font","media","stylesheet"].includes(req.resourceType())) {
+                req.abort();
+              } else {
+                req.continue();
               }
-            } catch {}
-          });
+            });
+            page.on("response", async res => {
+              try {
+                const ct = res.headers()["content-type"] || "";
+                if (ct.includes("json") && res.status() === 200) {
+                  const text = await res.text().catch(() => "");
+                  extractEmails(text).forEach(e => allEmails.add(e));
+                }
+              } catch {}
+            });
+          },
+        ],
+
+        async requestHandler({ request, page }) {
+          const url  = request.url;
+          const html = await page.content();
+          const text = await page.evaluate(() => document.body?.innerText || "");
+
+          extractEmails(html + " " + text).forEach(e => allEmails.add(e));
+          extractPhones(text).forEach(p => allPhones.add(p));
+
+          const mailtos = await page.$$eval("a[href^='mailto:']", els =>
+            els.map(el => el.href.replace("mailto:", "").split("?")[0].toLowerCase())
+          );
+          mailtos.filter(e => !isJunkEmail(e)).forEach(e => allEmails.add(e));
+
+          if (url === baseUrl || url === baseUrl + "/") {
+            if (!result.techStack.length)      result.techStack = detectTechStack(html);
+            if (!Object.keys(result.socials).length) {
+              result.socials      = extractSocials(html);
+              result.social_links = result.socials;
+            }
+            if (!Object.keys(result.schema).length) result.schema = extractSchemaOrg(html);
+            if (!result.description) {
+              result.description = await page.$eval(
+                'meta[name="description"], meta[property="og:description"]',
+                el => el.getAttribute("content") || ""
+              ).catch(() => "");
+            }
+          }
+
+          if (!result.crawledPages.includes(url)) result.crawledPages.push(url);
+          console.log(`[EnrichJob] Puppeteer: ${url} — emails: ${allEmails.size}`);
+
+          if (allEmails.size >= 3 && url !== baseUrl) return;
         },
-      ],
 
-      async requestHandler({ request, page }) {
-        const url  = request.url;
-        const html = await page.content();
-        const text = await page.evaluate(() => document.body?.innerText || "");
+        failedRequestHandler({ request, error }) {
+          console.warn(`[EnrichJob] Puppeteer failed: ${request.url} — ${error.message}`);
+        },
+      }, new Configuration({ persistStorage: false }));
 
-        extractEmails(html + " " + text).forEach(e => allEmails.add(e));
-        extractPhones(text).forEach(p => allPhones.add(p));
-
-        const mailtos = await page.$$eval("a[href^='mailto:']", els =>
-          els.map(el => el.href.replace("mailto:", "").split("?")[0].toLowerCase())
-        );
-        mailtos.filter(e => !isJunkEmail(e)).forEach(e => allEmails.add(e));
-
-        if (url === baseUrl || url === baseUrl + "/") {
-          // techStack — Cheerio phase এ না পেলে এখানে নাও
-          if (!result.techStack.length)
-            result.techStack = detectTechStack(html);
-          if (!Object.keys(result.socials).length) {
-            result.socials      = extractSocials(html);
-            result.social_links = result.socials;
-          }
-          if (!Object.keys(result.schema).length)
-            result.schema = extractSchemaOrg(html);
-          if (!result.description) {
-            result.description = await page.$eval(
-              'meta[name="description"], meta[property="og:description"]',
-              el => el.getAttribute("content") || ""
-            ).catch(() => "");
-          }
-        }
-
-        if (!result.crawledPages.includes(url)) result.crawledPages.push(url);
-        console.log(`[EnrichJob] Puppeteer: ${url} — emails: ${allEmails.size}`);
-
-        // ৩টা email পেলে বাকি page বাদ দাও
-        if (allEmails.size >= 3 && url !== baseUrl) return;
-      },
-
-      failedRequestHandler({ request, error }) {
-        console.warn(`[EnrichJob] Puppeteer failed: ${request.url} — ${error.message}`);
-      },
-    }, new Configuration({ persistStorage: false }));
-
-    try { await puppeteerCrawler.run(urlsToCrawl); }
-    catch (err) { console.error("[EnrichJob] Puppeteer error:", err.message); }
-    } // end puppeteerAvailable
+      try { await puppeteerCrawler.run(urlsToCrawl); }
+      catch (err) { console.error("[EnrichJob] Puppeteer error:", err.message); }
+    }
   }
 
-  // ── Phase 1C: Hunter.io fallback — Crawlee email না পেলে ────────────────
-  // Apollo এর জায়গায় Hunter.io — 50x সস্তা, reliable domain search
+  // ── Phase 1C: Hunter.io fallback ──────────────────────────────────────────
   if (allEmails.size === 0) {
     console.log(`[EnrichJob] No emails from crawl → trying Hunter.io for ${domain}`);
     const hunterResult = await getEmailFromHunter(domain);
     if (hunterResult?.email) {
       allEmails.add(hunterResult.email);
       result.hunterUsed    = true;
-      // contactName/contactTitle enrichJob result এ যোগ করো
       result.contactName   = hunterResult.contactName  || null;
       result.contactTitle  = hunterResult.contactTitle || null;
       if (hunterResult.linkedin && !result.socials.linkedin) {
@@ -404,7 +408,6 @@ export async function runEnrichJob(inputData, userId) {
   // ── Phase 2: Email classification ─────────────────────────────────────────
   result.emails = [...allEmails].slice(0, 8);
 
-  // Schema.org email সবার আগে রাখো (সবচেয়ে reliable)
   if (result.schema.email && !isJunkEmail(result.schema.email)) {
     result.emails.unshift(result.schema.email);
     result.emails = [...new Set(result.emails)];
@@ -419,7 +422,7 @@ export async function runEnrichJob(inputData, userId) {
   result.work_email     = workEmails[0]     || null;
   result.personal_email = personalEmails[0] || null;
 
-  // ── Phase 2B: Pattern prediction — সব method fail হলে ───────────────────
+  // ── Phase 2B: Pattern prediction ──────────────────────────────────────────
   if (!result.work_email && !result.personal_email && result.emails.length === 0) {
     const predicted = predictEmail(name, domain);
     if (predicted) {
@@ -438,10 +441,7 @@ export async function runEnrichJob(inputData, userId) {
   if (result.socials.linkedin) result.linkedin_matched = true;
 
   const finalDescription = result.schema.description || result.description || null;
-  const companyName      = result.schema.name || name || null;
 
-  // crm_ready — work_email থাকলে এবং phone বা linkedin যেকোনো একটা হলেই ready
-  // আগে: companyName ও দরকার ছিল — এখন relaxed করা হয়েছে
   if (result.work_email && (result.phone_found || result.linkedin_matched)) {
     result.crm_ready = true;
   }
@@ -455,29 +455,40 @@ export async function runEnrichJob(inputData, userId) {
     ` | Pattern: ${result.patternPredicted}`
   );
 
-  // ── Phase 4: DB update (leadId থাকলে) ────────────────────────────────────
-  const updateData = {
-    email:            result.work_email || result.emails[0] || null,
-    work_email:       result.work_email,
-    personal_email:   result.personal_email,
-    phone:            finalPhone,
-    description:      finalDescription,
-    linkedin_url:     result.socials.linkedin     || null,
-    social_links:     result.socials              || {},
-    tech_stack:       result.techStack            || [],
-    phone_found:      result.phone_found,
-    linkedin_matched: result.linkedin_matched,
-    crm_ready:        result.crm_ready,
-  };
+  // ── Phase 4: DB update ────────────────────────────────────────────────────
+  // targetTable = "leads_verified"  → Enrichment Hub flow (manual enrich)
+  // targetTable = null              → Pipeline flow (pipelineFilterJob handles DB write)
+  const hasData = result.emails.length > 0 || result.phone_found || result.linkedin_matched;
 
-  if (leadId && (result.emails.length > 0 || result.phone_found || result.linkedin_matched)) {
-    await supabase
-      .from("extension_database")
+  if (leadId && targetTable && hasData) {
+    const updateData = {
+      email:            result.work_email || result.emails[0] || null,
+      work_email:       result.work_email,
+      personal_email:   result.personal_email,
+      phone:            finalPhone,
+      description:      finalDescription,
+      linkedin_url:     result.socials.linkedin     || null,
+      social_links:     result.socials              || {},
+      tech_stack:       result.techStack            || [],
+      phone_found:      result.phone_found,
+      linkedin_matched: result.linkedin_matched,
+      crm_ready:        result.crm_ready,
+      updated_at:       new Date().toISOString(),
+    };
+
+    const { error: updateErr } = await supabase
+      .from(targetTable)          // "leads_verified" — correct table
       .update(updateData)
-      .eq("hash", leadId)
-      .eq("user_id", userId);
+      .eq("id", leadId);          // leads_verified.id দিয়ে match
 
-    console.log(`[EnrichJob] Updated lead ${leadId} (CRM Ready: ${result.crm_ready})`);
+    if (updateErr) {
+      console.error(`[EnrichJob] DB update error (${targetTable}):`, updateErr.message);
+    } else {
+      console.log(`[EnrichJob] Updated ${targetTable} row ${leadId} (CRM Ready: ${result.crm_ready})`);
+    }
+  } else if (leadId && !targetTable) {
+    // Pipeline flow — DB write pipelineFilterJob এ হবে, এখানে skip
+    console.log(`[EnrichJob] leadId=${leadId} but no targetTable — skipping DB write (pipeline handles it)`);
   }
 
   return result;

@@ -68,6 +68,7 @@ const SCRAPE_JOB_NAMES = new Set([
   "youtube-scrape",
   "websites-scrape",
   "startup-db-scrape",
+  "amazon-scrape",  // Amazon product search
 ]);
 
 // ── Main job processor ────────────────────────────────────────────────────────

@@ -1,7 +1,7 @@
 /**
  * CompX — discoverScrapeJob.js
  * Platform Source routing: Google Maps | LinkedIn | Websites | Startup DB
- * Enrichment: Website (Firecrawl multi-page) | Email (Apollo) | Pattern fallback
+ * Enrichment: Website (Firecrawl multi-page) | Email (Hunter.io) | Pattern fallback
  */
 
 import FirecrawlApp from "@mendable/firecrawl-js";
@@ -42,8 +42,8 @@ const ENRICHMENT_SCRAPE_COST = {
   ai: 1,
 };
 
-/** Apollo API surcharge when lookup runs (must match discoverCosts.ts APOLLO_LOOKUP_COST) */
-const APOLLO_LOOKUP_COST = 5;
+/** Hunter.io API surcharge when lookup runs (must match discoverCosts.ts HUNTER_LOOKUP_COST) */
+const HUNTER_LOOKUP_COST = 3;
 
 async function deductUserCredits(userId, amount, orgId) {
   const { error } = await supabase.rpc("deduct_credits", {
@@ -339,108 +339,131 @@ function buildLinkedInQuery(keyword, location, linkedinFilters = {}) {
     : `${keyword} site:linkedin.com/in OR site:linkedin.com/company`;
 }
 
+// ── LinkedIn result mapper (shared by Apify + fallbacks) ─────────────────────
+function mapLinkedInSerperResult(r, keyword, location, linkedinFilters) {
+  const isProfile = r.link?.includes("linkedin.com/in/");
+  if (isProfile) {
+    const { fullName, contactTitle, company } = parseLinkedInProfileTitle(r.title || "");
+    return {
+      id: `li_${Math.random().toString(36).slice(2, 9)}`,
+      name: company || fullName,
+      contactName: fullName,
+      contactTitle: contactTitle || keyword,
+      address: location || "",
+      industry: contactTitle || keyword,
+      website: null, phone: null, email: null,
+      linkedin: r.link || null,
+      snippet: r.snippet || "",
+      source: "linkedin",
+      linkedinFilters,
+    };
+  }
+  const linkedinMatch = r.link?.match(/linkedin\.com\/company\/([\w-]+)/);
+  const companySlug   = linkedinMatch?.[1] || "";
+  const companyName   = r.title?.replace(/ \| LinkedIn$/, "").replace(/ - LinkedIn$/, "").trim() || companySlug;
+  return {
+    id: `li_${companySlug || Math.random()}`,
+    name: companyName,
+    address: location || "",
+    industry: keyword,
+    website: null, phone: null, email: null,
+    linkedin: r.link || null,
+    snippet: r.snippet || "",
+    source: "linkedin",
+    linkedinFilters,
+  };
+}
+
 async function searchLinkedIn(keyword, location, maxResults, jobId, linkedinFilters = {}) {
   const query = buildLinkedInQuery(keyword, location, linkedinFilters);
   const searchPeople = (linkedinFilters.jobTitles?.length || linkedinFilters.targetAudiences?.length);
+  const apifyToken = process.env.APIFY_API_TOKEN;
 
   await logToTerminal(jobId, `LinkedIn query: ${query}`);
 
-  // Primary: Serper.dev
-  await logToTerminal(jobId, `Searching LinkedIn via Serper.dev (${searchPeople ? "people" : "companies"})...`);
-  const serperData = await serperSearch("google", query, maxResults);
-  if (serperData) {
-    const organicResults = serperData.organic || [];
-    await logToTerminal(jobId, `Serper.dev LinkedIn: ${organicResults.length} results ✅`);
-    if (organicResults.length > 0) {
-      return organicResults.slice(0, maxResults).map(r => {
-        const isProfile = r.link?.includes("linkedin.com/in/");
-        if (isProfile) {
-          const { fullName, contactTitle, company } = parseLinkedInProfileTitle(r.title || "");
+  // ── Primary: Apify LinkedIn scraper ─────────────────────────────────────────
+  if (apifyToken) {
+    try {
+      await logToTerminal(jobId, `[LinkedIn] Apify primary — ${searchPeople ? "people" : "companies"} search`);
+
+      const actorInput = searchPeople
+        ? {
+            // People search
+            searchUrl: `https://www.linkedin.com/search/results/people/?keywords=${encodeURIComponent(keyword)}${location ? `&location=${encodeURIComponent(location)}` : ""}`,
+            count: maxResults,
+          }
+        : {
+            // Company search
+            searchUrl: `https://www.linkedin.com/search/results/companies/?keywords=${encodeURIComponent(keyword)}${location ? `&location=${encodeURIComponent(location)}` : ""}`,
+            count: maxResults,
+          };
+
+      const apifyResults = await runApifyActor(
+        searchPeople ? "curious_coder~linkedin-people-search-scraper" : "curious_coder~linkedin-company-search-scraper",
+        actorInput,
+        apifyToken,
+        jobId,
+        120000
+      );
+
+      if (apifyResults && apifyResults.length > 0) {
+        await logToTerminal(jobId, `[LinkedIn] Apify: ${apifyResults.length} results ✅`);
+        return apifyResults.slice(0, maxResults).map(r => {
+          const isProfile = !!(r.firstName || r.lastName || r.profileUrl?.includes("/in/"));
+          if (isProfile) {
+            return {
+              id:           `li_${Math.random().toString(36).slice(2, 9)}`,
+              name:         r.companyName || `${r.firstName || ""} ${r.lastName || ""}`.trim(),
+              contactName:  `${r.firstName || ""} ${r.lastName || ""}`.trim() || null,
+              contactTitle: r.headline || r.title || keyword,
+              address:      r.location || location || "",
+              industry:     r.industry || keyword,
+              website:      null,
+              phone:        null,
+              email:        r.email || null,
+              linkedin:     r.profileUrl || r.url || null,
+              snippet:      r.summary || r.about || "",
+              source:       "linkedin",
+              linkedinFilters,
+            };
+          }
           return {
-            id: `li_${Math.random().toString(36).slice(2, 9)}`,
-            name: company || fullName,
-            contactName: fullName,
-            contactTitle: contactTitle || keyword,
-            address: location || "",
-            rating: "",
-            industry: contactTitle || keyword,
-            website: null,
-            phone: null,
-            email: null,
-            linkedin: r.link || null,
-            snippet: r.snippet || "",
-            source: "linkedin",
+            id:       `li_${Math.random().toString(36).slice(2, 9)}`,
+            name:     r.name || r.companyName || "",
+            address:  r.location || location || "",
+            industry: r.industry || keyword,
+            website:  r.website || null,
+            phone:    null,
+            email:    null,
+            linkedin: r.linkedinUrl || r.url || null,
+            snippet:  r.description || r.about || "",
+            source:   "linkedin",
             linkedinFilters,
           };
-        }
-        const linkedinMatch = r.link?.match(/linkedin\.com\/company\/([\w-]+)/);
-        const companySlug   = linkedinMatch?.[1] || "";
-        const companyName   = r.title?.replace(/ \| LinkedIn$/, "").replace(/ - LinkedIn$/, "").trim() || companySlug;
-        return {
-          id: `li_${companySlug || Math.random()}`,
-          name: companyName,
-          address: location || "",
-          rating: "",
-          industry: keyword,
-          website: null,
-          phone: null,
-          email: null,
-          linkedin: r.link || null,
-          snippet: r.snippet || "",
-          source: "linkedin",
-          linkedinFilters,
-        };
-      }).filter(r => r.name || r.contactName);
+        }).filter(r => r.name || r.contactName);
+      }
+
+      await logToTerminal(jobId, `[LinkedIn] Apify returned 0 results — falling back`);
+    } catch (apifyErr) {
+      await logToTerminal(jobId, `[LinkedIn] Apify error: ${apifyErr.message} — falling back`);
     }
   }
 
-  // Fallback: SerpAPI
-  await logToTerminal(jobId, `Falling back to SerpAPI (LinkedIn)...`);
-  const sKey = SERPAPI_KEY();
-  if (!sKey) { await logToTerminal(jobId, `No SerpAPI key for LinkedIn search`); return []; }
-
-  const url = `https://serpapi.com/search.json?engine=google&q=${encodeURIComponent(query)}&api_key=${sKey}&num=${maxResults}`;
-  const res  = await fetch(url);
-  const json = await res.json();
-
-  if (json.error) { await logToTerminal(jobId, `SerpAPI LinkedIn error: ${json.error}`); return []; }
-
-  const organicResults = json.organic_results || [];
-  await logToTerminal(jobId, `SerpAPI LinkedIn: ${organicResults.length} results`);
-
-  return organicResults.slice(0, maxResults).map(r => {
-    const isProfile = r.link?.includes("linkedin.com/in/");
-    if (isProfile) {
-      const { fullName, contactTitle, company } = parseLinkedInProfileTitle(r.title || "");
-      return {
-        id: `li_${Math.random().toString(36).slice(2, 9)}`,
-        name: company || fullName,
-        contactName: fullName,
-        contactTitle: contactTitle || keyword,
-        address: location || "",
-        industry: contactTitle || keyword,
-        website: null, phone: null, email: null,
-        linkedin: r.link || null,
-        snippet: r.snippet || "",
-        source: "linkedin",
-        linkedinFilters,
-      };
+  // ── Fallback 1: Serper.dev ───────────────────────────────────────────────────
+  await logToTerminal(jobId, `[LinkedIn] Serper.dev fallback...`);
+  const serperData = await serperSearch("google", query, maxResults);
+  if (serperData) {
+    const organicResults = serperData.organic || [];
+    await logToTerminal(jobId, `[LinkedIn] Serper: ${organicResults.length} results`);
+    if (organicResults.length > 0) {
+      return organicResults.slice(0, maxResults)
+        .map(r => mapLinkedInSerperResult(r, keyword, location, linkedinFilters))
+        .filter(r => r.name || r.contactName);
     }
-    const linkedinMatch = r.link?.match(/linkedin\.com\/company\/([\w-]+)/);
-    const companySlug   = linkedinMatch?.[1] || "";
-    const companyName   = r.title?.replace(/ \| LinkedIn$/, "").replace(/ - LinkedIn$/, "").trim() || companySlug;
-    return {
-      id:       `li_${companySlug || Math.random()}`,
-      name:     companyName,
-      address:  location || "",
-      industry: keyword,
-      website:  null, phone: null, email: null,
-      linkedin: r.link || null,
-      snippet:  r.snippet || "",
-      source:   "linkedin",
-      linkedinFilters,
-    };
-  }).filter(r => r.name || r.contactName);
+  }
+
+  await logToTerminal(jobId, `[LinkedIn] All sources exhausted — no results`);
+  return [];
 }
 
 // ── 3. Websites Source ───────────────────────────────────────────────────────
@@ -547,7 +570,7 @@ async function searchStartupDB(keyword, location, maxResults, jobId) {
 }
 
 // ── 5. YouTube Source ────────────────────────────────────────────────────────
-async function searchYouTube(keyword, location, maxResults, jobId, enrichments = {}) {
+async function searchYouTube(keyword, location, maxResults, jobId, enrichments = {}, youtubeFilters = {}) {
   // Force disable About page scraping until proxy is configured
   enrichments = { ...enrichments, email: false };
 
@@ -567,7 +590,9 @@ async function searchYouTube(keyword, location, maxResults, jobId, enrichments =
   searchUrl.searchParams.set("q", searchQuery);
   searchUrl.searchParams.set("type", "channel");
   searchUrl.searchParams.set("maxResults", String(Math.min(maxResults * 2, 50))); // 2x fetch, filter later
-  searchUrl.searchParams.set("relevanceLanguage", "en"); // English-first results
+  // Language from filter or default to English
+  const langCode = youtubeFilters.language || "en";
+  if (langCode) searchUrl.searchParams.set("relevanceLanguage", langCode);
   searchUrl.searchParams.set("key", apiKey);
 
   const searchRes  = await fetch(searchUrl.toString());
@@ -603,20 +628,44 @@ async function searchYouTube(keyword, location, maxResults, jobId, enrichments =
   let channels = detailJson.items || [];
   await logToTerminal(jobId, `YouTube: details fetched for ${channels.length} channels`);
 
-  // ── Step 3: Quality filter — business channels only ───────────────────────
-  channels = channels.filter(ch => {
-    const subs     = parseInt(ch.statistics?.subscriberCount || "0");
-    const videos   = parseInt(ch.statistics?.videoCount || "0");
-    const desc     = (ch.snippet?.description || "").toLowerCase();
-    const hasWebsite = !!(ch.brandingSettings?.channel?.unsubscribedTrailer ||
-                          ch.snippet?.description?.match(/https?:\/\//));
+  // ── Step 3: Quality filter — youtubeFilters + business signals ──────────────
+  const subMin     = parseInt(youtubeFilters.subscriberMin  || "1000");
+  const subMax     = youtubeFilters.subscriberMax ? parseInt(youtubeFilters.subscriberMax) : Infinity;
+  const minVideos  = parseInt(youtubeFilters.minVideoCount  || "10");
+  const onlyWebsite = youtubeFilters.hasWebsite === true || youtubeFilters.hasWebsite === "true";
+  const contentType = youtubeFilters.contentType || "any"; // "any"|"longform"|"shorts"|"both"
 
-    // Filter out:
-    // 1. Channels with < 100 subscribers (too small, not a business)
-    // 2. Channels with 0 videos
-    // 3. Personal hobby channels (no business keywords in description)
-    if (subs < 100) return false;
-    if (videos === 0) return false;
+  await logToTerminal(jobId, `YouTube filters — subs: ${subMin}–${subMax === Infinity ? "∞" : subMax}, minVideos: ${minVideos}, onlyWebsite: ${onlyWebsite}, contentType: ${contentType}`);
+
+  channels = channels.filter(ch => {
+    const subs   = parseInt(ch.statistics?.subscriberCount || "0");
+    const videos = parseInt(ch.statistics?.videoCount      || "0");
+    const desc   = (ch.snippet?.description || "").toLowerCase();
+
+    // Subscriber range filter
+    if (subs < subMin) return false;
+    if (subs > subMax) return false;
+
+    // Min video count filter
+    if (videos < minVideos) return false;
+
+    // Has website filter — description এ http link আছে কিনা
+    if (onlyWebsite) {
+      const hasWebLink = !!(desc.match(/https?:\/\/(?!youtube\.com|youtu\.be|google\.com|instagram\.com|facebook\.com|twitter\.com|tiktok\.com)[^\s]+/));
+      if (!hasWebLink) return false;
+    }
+
+    // Content type filter — channel description বা title থেকে guess করা
+    if (contentType === "shorts") {
+      const shortsSignal = desc.includes("short") || (ch.snippet?.title || "").toLowerCase().includes("short");
+      if (!shortsSignal) return false;
+    } else if (contentType === "longform") {
+      // Shorts-only channels বাদ দাও
+      const shortsOnly = (ch.snippet?.title || "").toLowerCase().includes("#shorts") ||
+                         (desc.includes("#shorts") && !desc.includes("video") && !desc.includes("tutorial"));
+      if (shortsOnly) return false;
+    }
+    // "both" or "any" = no filter
 
     // Business signal — description এ contact/business keyword আছে কিনা
     const businessSignals = ["contact", "business", "email", "call", "service",
@@ -624,10 +673,41 @@ async function searchYouTube(keyword, location, maxResults, jobId, enrichments =
       "agency", "studio", "clinic", "school", "academy", "company", "ltd"];
     const hasBusinessSignal = businessSignals.some(s => desc.includes(s));
 
-    // 500+ subscribers হলে business signal ছাড়াও allow করো
-    if (subs >= 500) return true;
+    // 5000+ subscribers হলে business signal ছাড়াও allow করো
+    if (subs >= 5000) return true;
     return hasBusinessSignal;
   });
+
+  // Last upload date filter — videos API দিয়ে check করবো
+  const lastUploadDays = youtubeFilters.lastUploadDays ? parseInt(youtubeFilters.lastUploadDays) : null;
+  if (lastUploadDays && channels.length > 0) {
+    await logToTerminal(jobId, `Checking last upload date (within ${lastUploadDays} days)...`);
+    const cutoffDate = new Date(Date.now() - lastUploadDays * 24 * 60 * 60 * 1000).toISOString();
+
+    const activeChannels = [];
+    for (const ch of channels) {
+      try {
+        const recentUrl = new URL("https://www.googleapis.com/youtube/v3/search");
+        recentUrl.searchParams.set("part", "snippet");
+        recentUrl.searchParams.set("channelId", ch.id);
+        recentUrl.searchParams.set("type", "video");
+        recentUrl.searchParams.set("order", "date");
+        recentUrl.searchParams.set("maxResults", "1");
+        recentUrl.searchParams.set("publishedAfter", cutoffDate);
+        recentUrl.searchParams.set("key", apiKey);
+
+        const recentRes  = await fetch(recentUrl.toString());
+        const recentJson = await recentRes.json();
+        if ((recentJson.items || []).length > 0) {
+          activeChannels.push(ch);
+        }
+      } catch {
+        activeChannels.push(ch); // error হলে include করো
+      }
+    }
+    channels = activeChannels;
+    await logToTerminal(jobId, `YouTube: ${channels.length} active channels (last upload within ${lastUploadDays} days)`);
+  }
 
   // maxResults limit
   channels = channels.slice(0, maxResults);
@@ -677,59 +757,92 @@ async function searchYouTube(keyword, location, maxResults, jobId, enrichments =
   // ── Step 3: Playwright scrape About page (email enrichment enabled হলে) ────
   // enrichments.email === true হলেই scrape করবে — quota বাঁচাতে
   if (enrichments.email) {
-    await logToTerminal(jobId, `Starting YouTube About page scraping...`);
- 
+    await logToTerminal(jobId, `Starting YouTube About page scraping (Playwright + Webshare proxy)...`);
+
     const { chromium } = await import("playwright");
-    const browser = await chromium.launch({ headless: true });
-    const context = await browser.newContext({
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    });
- 
+
+    // Webshare proxy config
+    const proxyUrl      = process.env.WEBSHARE_PROXY_URL || "http://proxy.webshare.io:80";
+    const proxyUser     = process.env.WEBSHARE_USERNAME;
+    const proxyPass     = process.env.WEBSHARE_PASSWORD;
+    const hasProxy      = !!(proxyUser && proxyPass);
+
+    const launchOptions = {
+      headless: true,
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+    };
+
+    const contextOptions = {
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      ...(hasProxy ? {
+        proxy: {
+          server:   proxyUrl,
+          username: proxyUser,
+          password: proxyPass,
+        }
+      } : {}),
+    };
+
+    if (!hasProxy) {
+      await logToTerminal(jobId, `[YouTube] No Webshare proxy configured — scraping without proxy (may get blocked)`);
+    } else {
+      await logToTerminal(jobId, `[YouTube] Using Webshare proxy: ${proxyUrl}`);
+    }
+
+    const browser = await chromium.launch(launchOptions);
+    const context = await browser.newContext(contextOptions);
+
     for (const ch of results) {
       try {
         const aboutUrl = `${ch.channelUrl}/about`;
         await logToTerminal(jobId, `Scraping: ${ch.name} → ${aboutUrl}`);
- 
+
         const page = await context.newPage();
-        await page.goto(aboutUrl, { waitUntil: "networkidle", timeout: 20000 });
-        await page.waitForTimeout(2000); // rate limit buffer
- 
+
+        // Block images/fonts to speed up loading
+        await page.route("**/*.{png,jpg,jpeg,gif,webp,svg,woff,woff2,ttf}", r => r.abort());
+
+        await page.goto(aboutUrl, { waitUntil: "domcontentloaded", timeout: 25000 });
+        await page.waitForTimeout(2500);
+
         const text = await page.evaluate(() => document.body.innerText);
- 
-        // Email extract — reuse same pattern as existing extractEmails()
+
+        // Email
         const emails = extractEmails(text);
         if (emails[0]) {
           ch.email = emails[0];
           await logToTerminal(jobId, `✉ Email found: ${ch.email}`);
         }
- 
+
         // Phone
         const phoneMatch = text.match(/(\+?[\d][\d\s\-().]{6,}[\d])/);
         if (phoneMatch) ch.phone = cleanPhone(phoneMatch[0]);
- 
-        // Social links
+
+        // Social & website links
         const links = await page.evaluate(() =>
           Array.from(document.querySelectorAll("a[href]")).map(a => a.href)
         );
-        ch.instagram   = links.find(l => l.includes("instagram.com/")) || null;
+
+        ch.instagram   = links.find(l => l.includes("instagram.com/") && !l.includes("instagram.com/p/")) || null;
         ch.twitter     = links.find(l => l.includes("twitter.com/") || l.includes("x.com/")) || null;
+        ch.facebook    = links.find(l => l.includes("facebook.com/") && !l.includes("facebook.com/sharer")) || null;
         ch.websiteLink = links.find(l =>
-          l && !l.includes("youtube.com") && !l.includes("google.com") &&
+          l && l.startsWith("http") &&
+          !l.includes("youtube.com") && !l.includes("google.com") &&
           !l.includes("instagram.com") && !l.includes("twitter.com") &&
-          l.startsWith("http")
+          !l.includes("facebook.com") && !l.includes("tiktok.com") &&
+          !l.includes("t.co")
         ) || null;
- 
-        // Linked website overrides channel URL
+
         if (ch.websiteLink) ch.website = ch.websiteLink;
- 
+
         await page.close();
+        await new Promise(r => setTimeout(r, 1500)); // rate limit buffer
       } catch (err) {
         await logToTerminal(jobId, `About scrape failed for ${ch.name}: ${err.message}`);
       }
     }
- 
+
     await browser.close();
   }
  
@@ -905,11 +1018,154 @@ async function searchInstagram(keyword, location, maxResults, jobId) {
       }));
 
   } catch (err) {
-    await logToTerminal(jobId, `[Instagram] Error: ${err.message}`);
+    await logToTerminal(jobId, `[Instagram] Apify error: ${err.message} — trying SerpAPI fallback`);
+
+    // ── SerpAPI Fallback ─────────────────────────────────────────────────────
+    try {
+      const sKey = SERPAPI_KEY();
+      if (!sKey) { await logToTerminal(jobId, `[Instagram] No SerpAPI key — giving up`); return []; }
+
+      const igQuery = location
+        ? `${keyword} instagram business ${location}`
+        : `${keyword} instagram business`;
+
+      await logToTerminal(jobId, `[Instagram] SerpAPI fallback query: ${igQuery}`);
+      const url = `https://serpapi.com/search.json?engine=google&q=${encodeURIComponent(igQuery)}&api_key=${sKey}&num=${maxResults}`;
+      const res  = await fetch(url);
+      const json = await res.json();
+
+      if (json.error) { await logToTerminal(jobId, `[Instagram] SerpAPI error: ${json.error}`); return []; }
+
+      const results = (json.organic_results || [])
+        .filter(r => r.link?.includes("instagram.com/"))
+        .slice(0, maxResults)
+        .map(r => {
+          const usernameMatch = r.link.match(/instagram\.com\/([^/?#]+)/);
+          const username = usernameMatch?.[1] || "";
+          return {
+            id:         `ig_${username || Math.random().toString(36).slice(2,8)}`,
+            name:       r.title?.replace(/ \(@[^)]+\)/, "").replace(/ • Instagram.*/, "").trim() || username,
+            company:    r.title?.replace(/ \(@[^)]+\)/, "").replace(/ • Instagram.*/, "").trim() || username,
+            industry:   keyword,
+            address:    location || "",
+            website:    null,
+            phone:      null,
+            email:      null,
+            source:     "instagram",
+            username,
+            handle:     `@${username}`,
+            profileUrl: `https://www.instagram.com/${username}/`,
+            snippet:    r.snippet || "",
+            followersCount: 0,
+            bio:        r.snippet || null,
+          };
+        })
+        .filter(r => r.username && r.username !== "p" && r.username !== "explore");
+
+      await logToTerminal(jobId, `[Instagram] SerpAPI fallback: ${results.length} results`);
+      return results;
+
+    } catch (fallbackErr) {
+      await logToTerminal(jobId, `[Instagram] SerpAPI fallback error: ${fallbackErr.message}`);
+      return [];
+    }
+  }
+}
+
+
+// ── 7. Amazon Source ─────────────────────────────────────────────────────────
+// SerpAPI Amazon engine — product search + seller info
+async function searchAmazon(keyword, location, maxResults, jobId) {
+  const sKey = SERPAPI_KEY();
+  if (!sKey) {
+    await logToTerminal(jobId, `[Amazon] No SerpAPI key — skipping`);
+    return [];
+  }
+
+  try {
+    // Step 1: Product search
+    await logToTerminal(jobId, `[Amazon] Searching products: "${keyword}"`);
+    const searchUrl = `https://serpapi.com/search.json?engine=amazon&amazon_domain=amazon.com&k=${encodeURIComponent(keyword)}&api_key=${sKey}`;
+    const searchRes  = await fetch(searchUrl);
+    const searchJson = await searchRes.json();
+
+    if (searchJson.error) {
+      await logToTerminal(jobId, `[Amazon] Search error: ${searchJson.error}`);
+      return [];
+    }
+
+    const products = searchJson.organic_results || searchJson.shopping_results || [];
+    await logToTerminal(jobId, `[Amazon] Found ${products.length} products`);
+
+    if (!products.length) return [];
+
+    // Step 2: Enrich each product with seller info
+    const results = [];
+    for (const product of products.slice(0, maxResults)) {
+      try {
+        const asin = product.asin;
+        let sellerName = product.seller_name || product.brand || null;
+        let sellerLink = null;
+        let productTitle = product.title || "";
+        let productPrice = product.price?.raw || product.price || null;
+        let productRating = product.rating || null;
+        let productReviews = product.reviews || null;
+        let productImage = product.thumbnail || null;
+
+        // If ASIN available, get product details for seller info
+        if (asin) {
+          const productUrl = `https://serpapi.com/search.json?engine=amazon_product&asin=${asin}&amazon_domain=amazon.com&api_key=${sKey}`;
+          const productRes  = await fetch(productUrl);
+          const productJson = await productRes.json();
+
+          if (!productJson.error) {
+            const info = productJson.product_results || {};
+            sellerName    = info.seller_name   || sellerName;
+            sellerLink    = info.seller_link   || null;
+            productTitle  = info.title         || productTitle;
+            productPrice  = info.price?.raw    || productPrice;
+            productRating = info.rating        || productRating;
+            productReviews = info.reviews      || productReviews;
+          }
+        }
+
+        results.push({
+          id:       `amz_${asin || Math.random().toString(36).slice(2, 8)}`,
+          name:     sellerName || productTitle,
+          company:  sellerName || productTitle,
+          industry: keyword,
+          address:  location || "",
+          website:  sellerLink || (asin ? `https://www.amazon.com/dp/${asin}` : null),
+          phone:    null,
+          email:    null,
+          source:   "amazon",
+          // Amazon-specific
+          asin,
+          productTitle,
+          productPrice,
+          productRating,
+          productReviews,
+          productImage,
+          sellerName,
+          sellerLink,
+          amazonUrl: asin ? `https://www.amazon.com/dp/${asin}` : null,
+        });
+
+        await logToTerminal(jobId, `[Amazon] ✅ ${productTitle} — Seller: ${sellerName || "unknown"}`);
+      } catch (err) {
+        await logToTerminal(jobId, `[Amazon] Product detail error: ${err.message}`);
+      }
+    }
+
+    await logToTerminal(jobId, `[Amazon] Done — ${results.length} products collected`);
+    return results;
+
+  } catch (err) {
+    await logToTerminal(jobId, `[Amazon] Error: ${err.message}`);
     return [];
   }
 }
- 
+
 // ════════════════════════════════════════════════════════════════════════════
 // ENRICHMENT FUNCTIONS
 // ════════════════════════════════════════════════════════════════════════════
@@ -962,41 +1218,64 @@ async function enrichWebsite(website, jobId) {
   }
 }
 
-// ── Apollo email lookup ───────────────────────────────────────────────────────
-async function getEmailFromApollo(companyName, domain, jobId) {
-  const apiKey = process.env.APOLLO_API_KEY;
+// ── Hunter.io email lookup ────────────────────────────────────────────────────
+async function getEmailFromHunter(companyName, domain, jobId) {
+  const apiKey = process.env.HUNTER_API_KEY;
   if (!apiKey) return null;
+  if (!domain)  return null;
 
   try {
-    await logToTerminal(jobId, `Apollo lookup: ${companyName}`);
-    const res = await fetch("https://api.apollo.io/v1/mixed_people/search", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Api-Key": apiKey },
-      body: JSON.stringify({
-        organization_name: companyName,
-        person_titles: ["owner", "founder", "ceo", "director", "manager"],
-        per_page: 3,
-      }),
-    });
+    await logToTerminal(jobId, `Hunter.io lookup: ${domain}`);
 
-    const json   = await res.json();
-    const people = json?.people || [];
+    // 1. Domain Search — সব emails খোঁজো
+    const searchUrl = `https://api.hunter.io/v2/domain-search?domain=${encodeURIComponent(domain)}&limit=5&api_key=${apiKey}`;
+    const searchRes  = await fetch(searchUrl);
+    const searchJson = await searchRes.json();
 
-    for (const person of people) {
-      if (person.email && !person.email.includes("email_not_unlocked")) {
-        await logToTerminal(jobId, `Apollo found: ${person.email}`);
-        return {
-          email:        person.email,
-          phone:        person.phone_numbers?.[0]?.sanitized_number || null,
-          linkedin:     person.linkedin_url || null,
-          contactName:  `${person.first_name} ${person.last_name}`.trim(),
-          contactTitle: person.title || null,
-        };
-      }
+    const emails = searchJson?.data?.emails || [];
+
+    // Owner/founder/CEO priority
+    const priorityTitles = ["owner", "founder", "ceo", "director", "manager", "president"];
+    const priorityEmail  = emails.find(e =>
+      e.position && priorityTitles.some(t => e.position.toLowerCase().includes(t))
+    );
+    const bestEmail = priorityEmail || emails[0];
+
+    if (bestEmail?.value) {
+      await logToTerminal(jobId, `Hunter found: ${bestEmail.value}`);
+      return {
+        email:        bestEmail.value,
+        phone:        null, // Hunter does not return phone
+        linkedin:     bestEmail.linkedin || null,
+        contactName:  [bestEmail.first_name, bestEmail.last_name].filter(Boolean).join(" ") || null,
+        contactTitle: bestEmail.position || null,
+        confidence:   bestEmail.confidence || null,
+      };
     }
+
+    // 2. Email Finder fallback — domain থেকে best guess
+    const finderUrl = `https://api.hunter.io/v2/email-finder?domain=${encodeURIComponent(domain)}&company=${encodeURIComponent(companyName)}&api_key=${apiKey}`;
+    const finderRes  = await fetch(finderUrl);
+    const finderJson = await finderRes.json();
+
+    const found = finderJson?.data;
+    if (found?.email) {
+      await logToTerminal(jobId, `Hunter finder: ${found.email} (confidence: ${found.score}%)`);
+      return {
+        email:        found.email,
+        phone:        null,
+        linkedin:     null,
+        contactName:  [found.first_name, found.last_name].filter(Boolean).join(" ") || null,
+        contactTitle: found.position || null,
+        confidence:   found.score || null,
+      };
+    }
+
+    await logToTerminal(jobId, `Hunter: no email found for ${domain}`);
     return null;
+
   } catch (err) {
-    await logToTerminal(jobId, `Apollo error: ${err.message}`);
+    await logToTerminal(jobId, `Hunter error: ${err.message}`);
     return null;
   }
 }
@@ -1013,8 +1292,9 @@ export async function runDiscoverScrape(inputData, userId, job, proxy) {
     maxResults  = 10,
     source      = "google_maps",
     enrichments = {},
-    linkedinFilters = null,
-    orgId       = null,
+    linkedinFilters  = null,
+    youtubeFilters   = {},
+    orgId            = null,
   } = inputData;
 
   await logger.log(`Starting: "${keyword}" in "${location}" [source: ${source}]`);
@@ -1029,7 +1309,9 @@ export async function runDiscoverScrape(inputData, userId, job, proxy) {
   } else if (source === "startup_db") {
     results = await searchStartupDB(keyword, location, maxResults, jobId);
   } else if (source === "youtube") {
-    results = await searchYouTube(keyword, location, maxResults, jobId, enrichments);
+    results = await searchYouTube(keyword, location, maxResults, jobId, enrichments, inputData.youtubeFilters || {});
+  } else if (source === "amazon") {
+    results = await searchAmazon(keyword, location, maxResults, jobId);
   } else if (source === "instagram" || source === "instagram_biz") {
     results = await searchInstagram(keyword, location, maxResults, jobId);
   } else {
@@ -1050,7 +1332,7 @@ export async function runDiscoverScrape(inputData, userId, job, proxy) {
 
   const processedLeads = [];
   let totalCreditsSpent = 0;
-  let metrics = { emailsFound: 0, patternPredicted: 0, apolloUsed: 0, enrichSkipped: 0, scrapeSkipped: 0 };
+  let metrics = { emailsFound: 0, patternPredicted: 0, hunterUsed: 0, enrichSkipped: 0, scrapeSkipped: 0 };
 
   const platformBaseCost = PLATFORM_SCRAPE_COST[source] || PLATFORM_SCRAPE_COST[source === "instagram" ? "instagram_biz" : source] || 3;
 
@@ -1104,7 +1386,7 @@ export async function runDiscoverScrape(inputData, userId, job, proxy) {
       }
     }
 
-    // Email discovery — 3 credits base; +5 when Apollo lookup runs
+    // Email discovery — 3 credits base; +5 when Hunter.io lookup runs
     if ((!lead.email && enrichments.email) || (enrichments.phone && !lead.phone)) {
       const domain = lead.website
         ? (() => { try { return new URL(lead.website).hostname.replace("www.", ""); } catch { return null; } })()
@@ -1133,33 +1415,33 @@ export async function runDiscoverScrape(inputData, userId, job, proxy) {
 
       if (emailEnrichReady || (enrichments.phone && !lead.phone)) {
         try {
-          let apolloData = null;
-          const hasApolloKey = !!process.env.APOLLO_API_KEY;
+          let hunterData = null;
+          const hasHunterKey = !!process.env.HUNTER_API_KEY;
 
-          if (hasApolloKey) {
-            const apolloCharged = await tryDeductUserCredits(
+          if (hasHunterKey && domain) {
+            const hunterCharged = await tryDeductUserCredits(
               userId,
-              APOLLO_LOOKUP_COST,
+              HUNTER_LOOKUP_COST,
               orgId,
-              `Apollo lookup: ${lead.name || lead.company}`,
-              "apollo_lookup"
+              `Hunter.io lookup: ${lead.name || lead.company}`,
+              "hunter_lookup"
             );
 
-            if (apolloCharged) {
-              costForLead += APOLLO_LOOKUP_COST;
-              apolloData = await getEmailFromApollo(lookupName, domain, jobId);
+            if (hunterCharged) {
+              costForLead += HUNTER_LOOKUP_COST;
+              hunterData = await getEmailFromHunter(lookupName, domain, jobId);
             } else {
-              await logger.log(`[SKIP] Apollo credits (${APOLLO_LOOKUP_COST}) — pattern fallback for ${lead.name}`);
+              await logger.log(`[SKIP] Hunter credits (${HUNTER_LOOKUP_COST}) — pattern fallback for ${lead.name}`);
             }
           }
 
-          if (apolloData) {
-            lead.email        = apolloData.email        || lead.email;
-            lead.phone        = apolloData.phone        || lead.phone;
-            lead.linkedin     = apolloData.linkedin     || lead.linkedin;
-            lead.contactName  = apolloData.contactName  || lead.contactName;
-            lead.contactTitle = apolloData.contactTitle || lead.contactTitle;
-            if (apolloData.email) { metrics.apolloUsed++; metrics.emailsFound++; }
+          if (hunterData) {
+            lead.email        = hunterData.email        || lead.email;
+            lead.phone        = hunterData.phone        || lead.phone;
+            lead.linkedin     = hunterData.linkedin     || lead.linkedin;
+            lead.contactName  = hunterData.contactName  || lead.contactName;
+            lead.contactTitle = hunterData.contactTitle || lead.contactTitle;
+            if (hunterData.email) { metrics.hunterUsed++; metrics.emailsFound++; }
           } else if (!lead.email && enrichments.email && emailEnrichReady) {
             lead.email = predictEmail(lead.name, lead.website);
             if (lead.email) metrics.patternPredicted++;
