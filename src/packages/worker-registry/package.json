@@ -1,0 +1,25 @@
+{
+  "name": "@compx/worker-registry",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./dist/registry.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@compx/scraper-core": "file:../scraper-core",
+    "@compx/plugin-website": "file:../../plugins/website",
+    "@compx/plugin-google-maps": "file:../../plugins/google-maps",
+    "@compx/plugin-instagram": "file:../../plugins/instagram",
+    "@compx/plugin-linkedin": "file:../../plugins/linkedin",
+    "@compx/plugin-youtube": "file:../../plugins/youtube",
+    "@compx/plugin-amazon": "file:../../plugins/amazon",
+    "@compx/plugin-facebook": "file:../../plugins/facebook",
+    "@compx/plugin-ebay": "file:../../plugins/ebay",
+    "@compx/plugin-tripadvisor": "file:../../plugins/tripadvisor"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "@types/node": "^20.14.0"
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "name": "compx-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "worker": "node src/index.js"
+  },
+  "dependencies": {
+    "@bull-board/api": "^5.20.0",
+    "@bull-board/express": "^5.20.0",
+    "@compx/scraper-core": "file:./src/packages/scraper-core",
+    "@compx/worker-ai-enrichment": "file:./src/packages/worker-ai-enrichment",
+    "@compx/worker-registry": "file:./src/packages/worker-registry",
+    "@compx/worker-scheduler": "file:./src/packages/worker-scheduler",
+    "@supabase/supabase-js": "^2.106.2",
+    "bullmq": "^5.12.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "ioredis": "^5.4.1",
+    "socket.io": "^4.7.5",
+    "ws": "^8.21.0"
+  }
+}

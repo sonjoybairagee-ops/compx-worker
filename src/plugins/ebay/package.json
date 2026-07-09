@@ -1,0 +1,12 @@
+{
+  "name": "@compx/plugin-ebay",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "scripts": { "build": "tsc -p tsconfig.json" },
+  "dependencies": {
+    "@compx/scraper-core": "file:../../packages/scraper-core",
+    "@supabase/supabase-js": "^2.106.2"
+  },
+  "devDependencies": { "typescript": "^5.5.0", "@types/node": "^20.14.0" }
+}
