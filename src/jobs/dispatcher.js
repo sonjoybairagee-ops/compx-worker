@@ -27,7 +27,7 @@
  * broken (2-arg `deduct_credits` call, missing `p_user_id`) and, even once
  * fixed, would have double-charged on top of the per-lead charging that
  * now happens INSIDE each plugin via `chargeForLead()` (see
- * scraper-core/credits.ts and each plugins/*/index.ts). Credits are spent
+ * scraper-core/credits.ts and each plugin's index.ts). Credits are spent
  * as leads are found, not once in bulk after the job finishes.
  */
 
