@@ -1,0 +1,15 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "outDir": "dist",
+    "rootDir": ".",
+    "declaration": true,
+    "strict": false,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true
+  },
+  "include": ["index.ts", "contract.ts", "credits.ts", "browser/**/*.ts", "proxy/**/*.ts", "session/**/*.ts", "crawler/**/*.ts", "parser/**/*.ts", "validation/**/*.ts", "storage/**/*.ts", "utils/**/*.ts"]
+}

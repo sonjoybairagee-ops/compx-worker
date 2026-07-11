@@ -1,0 +1,13 @@
+{
+  "name": "@compx/plugin-amazon",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "scripts": { "build": "tsc -p tsconfig.json" },
+  "dependencies": {
+    "@compx/scraper-core": "*",
+    "@supabase/supabase-js": "^2.106.2",
+    "playwright": "^1.51.0"
+  },
+  "devDependencies": { "typescript": "^5.5.0", "@types/node": "^20.14.0" }
+}

@@ -1,0 +1,15 @@
+{
+  "extends": "../../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": ".",
+    "baseUrl": ".",
+    "paths": {
+      "@supabase/supabase-js": ["../../../node_modules/@supabase/supabase-js"],
+      "@supabase/supabase-js/*": ["../../../node_modules/@supabase/supabase-js/*"],
+      "@compx/scraper-core": ["../../packages/scraper-core"],
+      "@compx/scraper-core/*": ["../../packages/scraper-core/*"]
+    }
+  },
+  "include": ["*.ts"]
+}

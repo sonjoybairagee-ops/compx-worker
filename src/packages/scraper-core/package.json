@@ -1,0 +1,24 @@
+{
+  "name": "@compx/scraper-core",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsc -w -p tsconfig.json"
+  },
+  "peerDependencies": {
+    "@supabase/supabase-js": "^2.106.2"
+  },
+  "dependencies": {
+    "playwright": "^1.51.0",
+    "crawlee": "^3.11.0",
+    "ioredis": "^5.4.1"
+  },
+  "devDependencies": {
+    "@supabase/supabase-js": "^2.106.2",
+    "typescript": "^5.5.0",
+    "@types/node": "^20.14.0"
+  }
+}
