@@ -48,7 +48,7 @@ async function chargeEnrichAttempt(userId, orgId, amount = ENRICHMENT_COSTS.webs
 
 const REDIS_URL = process.env.REDIS_URL || "redis://localhost:6379";
 const CONCURRENCY = parseInt(process.env.WORKER_CONCURRENCY || "3");
-const WORKER_PORT = parseInt(process.env.WORKER_PORT || "3001");
+const WORKER_PORT = parseInt(process.env.WORKER_PORT || process.env.PORT || "3001");
 
 const redis = new IORedis(REDIS_URL, {
   maxRetriesPerRequest: null, enableReadyCheck: false,
@@ -126,9 +126,8 @@ async function processJob(job) {
             if (!dedupId) return;
 
             const key = `enrich_lock:${kind}:${dedupId}`;
-            const locked = await redis.setnx(key, "1");
-            if (locked === 1) {
-              await redis.expire(key, 300); // 5 minutes TTL
+            const locked = await redis.set(key, "1", "EX", 300, "NX");
+            if (locked === "OK") {
               await leadEnrichmentQueue.add("lead_enrichment", {
                 type: "lead_enrichment",
                 kind,
@@ -191,8 +190,9 @@ console.log(`[Worker] Starting compx-jobs (concurrency: ${CONCURRENCY})`);
 
 const worker = new Worker("compx-jobs", processJob, {
   connection: redis, concurrency: CONCURRENCY,
-  stalledInterval: 30_000, lockDuration: 30_000,
-  limiter: { max: 10, duration: 60_000 },
+  stalledInterval: 120_000,
+  lockDuration: 60_000,
+  limiter: { max: 5, duration: 60_000 },
 });
 
 worker.on("completed", (job) => console.log(`[Worker] ✓ ${job.data.type || job.name} job ${job.id} complete`));
@@ -242,8 +242,8 @@ const leadEnrichWorker = new Worker("lead_enrichment", async (job) => {
 
   throw new Error(`Unknown enrichment kind: ${kind}`);
 }, {
-  connection: redis, concurrency: 5,
-  limiter: { max: 20, duration: 60_000 },
+  connection: redis, concurrency: 2,
+  limiter: { max: 10, duration: 60_000 },
 });
 leadEnrichWorker.on("completed", (job) => console.log(`[LeadEnrichment] ✓ ${job.data.kind} job ${job.id}`));
 leadEnrichWorker.on("failed", (job, err) => console.error(`[LeadEnrichment] ✗ ${job?.data?.kind} job ${job?.id}:`, err.message));
@@ -257,7 +257,9 @@ console.log(`[Worker] 🚀 CompX Worker started — concurrency: ${CONCURRENCY}`
 console.log(`[Worker] Redis: ${REDIS_URL ? new URL(REDIS_URL).host : "not configured"}`);
 
 const app = express();
-app.use("/admin/queues", createBullBoardRouter());
+if (process.env.ENABLE_BULL_BOARD === "true") {
+  app.use("/admin/queues", createBullBoardRouter());
+}
 const server = http.createServer(app);
 
 const io = new Server(server, {

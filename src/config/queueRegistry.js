@@ -4,23 +4,21 @@ import { redisConnection } from "./redisConnection.js";
 export const QUEUE_NAMES = {
   COMPX_JOBS: "compx-jobs",
   LEAD_ENRICHMENT: "lead_enrichment", // NEW — was created ad-hoc in index.js without cleanup options
-  DRIP_JOBS: "drip-jobs",
   AI_ENRICHMENT: "ai-enrichment", // NEW — Phase 14
   DLQ_COMPX_JOBS: "dlq-compx-jobs",
-  DLQ_DRIP_JOBS: "dlq-drip-jobs",
 };
 
 const defaultJobOptions = {
   attempts: 3,
   backoff: { type: "exponential", delay: 2000 },
-  removeOnComplete: { count: 500 },
-  removeOnFail: { count: 1000 },
+  removeOnComplete: { count: 20 },
+  removeOnFail: { count: 50 },
 };
 
 const dlqJobOptions = {
   attempts: 1,
-  removeOnComplete: false,
-  removeOnFail: false,
+  removeOnComplete: { count: 100 },
+  removeOnFail: { count: 200 },
 };
 
 const queues = new Map();
@@ -34,23 +32,18 @@ function getOrCreate(name, options = {}) {
 
 export const compxJobsQueue = () => getOrCreate(QUEUE_NAMES.COMPX_JOBS, defaultJobOptions);
 export const leadEnrichmentQueue = () => getOrCreate(QUEUE_NAMES.LEAD_ENRICHMENT, defaultJobOptions);
-export const dripQueue = () => getOrCreate(QUEUE_NAMES.DRIP_JOBS, { ...defaultJobOptions, attempts: 5 });
 export const aiEnrichmentQueue = () => getOrCreate(QUEUE_NAMES.AI_ENRICHMENT, defaultJobOptions);
 export const dlqCompxQueue = () => getOrCreate(QUEUE_NAMES.DLQ_COMPX_JOBS, dlqJobOptions);
-export const dlqDripQueue = () => getOrCreate(QUEUE_NAMES.DLQ_DRIP_JOBS, dlqJobOptions);
 
 export const DLQ_MAP = {
   [QUEUE_NAMES.COMPX_JOBS]: dlqCompxQueue,
-  [QUEUE_NAMES.DRIP_JOBS]: dlqDripQueue,
 };
 
 export function getAllQueues() {
   compxJobsQueue();
   leadEnrichmentQueue();
-  dripQueue();
   aiEnrichmentQueue();
   dlqCompxQueue();
-  dlqDripQueue();
   return Array.from(queues.values());
 }
 

@@ -4,7 +4,7 @@ services:
     runtime: node
     repo: https://github.com/sonjoybairagee-ops/compx-worker
     branch: master
-    buildCommand: npm install && npx playwright install chromium
+    buildCommand: npm install && npm run build && npx playwright install chromium
     startCommand: npm start
     envVars:
       - key: NODE_ENV

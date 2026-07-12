@@ -19,8 +19,8 @@
  *     the same way as before).
  */
 
-const POLL_INTERVAL = 30_000;
-const BATCH_SIZE = 20;
+const POLL_INTERVAL = 60_000;
+const BATCH_SIZE = 10;
 
 export function pollSupabaseJobs(queue, supabase) {
   let isPolling = false;

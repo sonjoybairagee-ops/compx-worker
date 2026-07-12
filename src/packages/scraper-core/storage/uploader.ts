@@ -9,6 +9,17 @@
  * `RowMapper`, and this module only handles what's genuinely shared: batching,
  * upsert-vs-insert routing (website-present vs website-absent, keeping the
  * org_id||user_id NULL-conflict fix from the original), and error counting.
+ *
+ * FIX: added a garbage_bin dedup pass. Previously, a lead the user
+ * manually (or Smart Clean Up) sent to garbage_bin would silently
+ * reappear as a brand-new leads_staging row the next time the same
+ * source/keyword was scraped — the website-based upsert only prevents
+ * duplicates against rows still LIVE in leads_staging, not ones that were
+ * deleted after being garbaged, and website-less leads (common for
+ * YouTube/Instagram, which usually have no linked website) had no dedup
+ * at all, not even against leads_staging itself. This checks the org's
+ * garbage_bin (by website when present, by normalized company/name when
+ * not) before inserting, and skips anything that was already thrown out.
  */
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -49,9 +60,13 @@ export interface UploadResult {
   errors: number;
   /** DB-generated UUIDs of every row actually inserted/upserted into leads_staging. */
   savedIds: string[];
+  /** Rows skipped because they match something already in this org's garbage_bin. */
+  skippedGarbage: number;
 }
 
 const BATCH_SIZE = 50;
+/** Safety cap on the garbage_bin dedup fetch — see note in fetchGarbageIdentities(). */
+const GARBAGE_FETCH_LIMIT = 5000;
 
 /** A baseline mapper covering the fields every source shares (name/company/website/socials). Plugins can spread this and add platform-specific fields on top rather than reimplementing it. */
 export function baseRowMapper(
@@ -97,6 +112,54 @@ export function baseRowMapper(
   return row;
 }
 
+function normalizeCompanyKey(name: string | null | undefined): string {
+  return (name || "").trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+/**
+ * Fetch this org's garbage_bin identities (website + normalized company
+ * name) for leads_staging-sourced entries, so saveLeads can skip
+ * re-inserting anything already thrown out.
+ *
+ * NOTE: this pulls up to GARBAGE_FETCH_LIMIT rows per org per saveLeads()
+ * call and builds the identity sets in memory (a jsonb `data->>field` path
+ * isn't practical to batch-match via PostgREST's `.in()` — the simplest
+ * robust option is fetching and filtering in JS). garbage_bin rows expire
+ * after 30 days, so this stays naturally bounded, but if a single org
+ * generates a very high garbage volume this could get slow — add a
+ * dedicated (org_id, source_table) index and/or narrow the time window
+ * (e.g. `.gte("created_at", ...)`) if that happens.
+ */
+async function fetchGarbageIdentities(
+  supabase: AnySupabase,
+  orgId: string
+): Promise<{ websites: Set<string>; companies: Set<string> }> {
+  const websites = new Set<string>();
+  const companies = new Set<string>();
+
+  const { data, error } = await supabase
+    .from("garbage_bin")
+    .select("data")
+    .eq("org_id", orgId)
+    .eq("source_table", "leads_staging")
+    .limit(GARBAGE_FETCH_LIMIT);
+
+  if (error) {
+    console.warn("[Uploader] garbage_bin dedup lookup failed — proceeding without it:", error.message);
+    return { websites, companies };
+  }
+
+  for (const row of data || []) {
+    const d = row?.data || {};
+    const normalizedWebsite = normalizeWebsite(d.website);
+    if (normalizedWebsite) websites.add(normalizedWebsite);
+    const companyKey = normalizeCompanyKey(d.company || d.name);
+    if (companyKey) companies.add(companyKey);
+  }
+
+  return { websites, companies };
+}
+
 export async function saveLeads<T = any>(
   supabase: AnySupabase,
   results: T[],
@@ -104,11 +167,28 @@ export async function saveLeads<T = any>(
   orgId: string | null,
   mapRow: RowMapper<T>
 ): Promise<UploadResult> {
-  if (!results?.length) return { saved: 0, errors: 0, savedIds: [] };
+  if (!results?.length) return { saved: 0, errors: 0, savedIds: [], skippedGarbage: 0 };
 
+  const effectiveOrgId = orgId || userId;
   const rows = results.map((item) => mapRow(item, userId, orgId));
-  const withWebsite = rows.filter((r) => r.website);
-  const withoutWebsite = rows.filter((r) => !r.website);
+
+  const garbage = await fetchGarbageIdentities(supabase, effectiveOrgId);
+
+  let skippedGarbage = 0;
+  const liveRows = rows.filter((r) => {
+    const isGarbaged = r.website
+      ? garbage.websites.has(r.website)
+      : garbage.companies.has(normalizeCompanyKey(r.company || r.name));
+    if (isGarbaged) skippedGarbage++;
+    return !isGarbaged;
+  });
+
+  if (skippedGarbage > 0) {
+    console.log(`[Uploader] Skipped ${skippedGarbage} lead(s) already in garbage_bin for org ${effectiveOrgId}`);
+  }
+
+  const withWebsite = liveRows.filter((r) => r.website);
+  const withoutWebsite = liveRows.filter((r) => !r.website);
 
   let saved = 0;
   let errors = 0;
@@ -147,6 +227,6 @@ export async function saveLeads<T = any>(
     }
   }
 
-  console.log(`[Uploader] Saved ${saved}/${results.length} leads (${errors} errors)`);
-  return { saved, errors, savedIds };
+  console.log(`[Uploader] Saved ${saved}/${results.length} leads (${errors} errors, ${skippedGarbage} skipped as already-garbaged)`);
+  return { saved, errors, savedIds, skippedGarbage };
 }

@@ -23,10 +23,13 @@ async function fetchFromSerper(input: GoogleMapsSerperInput, ctx: ProviderRunCon
   if (!apiKey) throw new ProviderError(ProviderErrorType.UNAUTHORIZED, "SERPER_API_KEY is not set in environment");
 
   const allResults: any[] = [];
+  const seenIds = new Set<string>();   // ✅ dedup track করার জন্য
   let page = 1;
   const maxRetries = 2;
+  const MAX_PAGES = 15;                 // ✅ hard safety cap
+  let hasMore = true;
 
-  while (allResults.length < maxResults) {
+  while (allResults.length < maxResults && page <= MAX_PAGES) {
     await logger.log(`Fetching from Serper.dev (page=${page})...`);
 
     let success = false;
@@ -53,7 +56,25 @@ async function fetchFromSerper(input: GoogleMapsSerperInput, ctx: ProviderRunCon
         }
 
         const places = data.places || [];
-        allResults.push(...places);
+        if (places.length === 0) {
+          hasMore = false;
+        } else {
+          // ✅ শুধু নতুন (আগে না দেখা) ফলাফল যোগ করো
+          const newPlaces = places.filter((p: any) => {
+            const id = p.placeId || p.cid || `${p.title}-${p.address}`;
+            if (seenIds.has(id)) return false;
+            seenIds.add(id);
+            return true;
+          });
+
+          if (newPlaces.length === 0) {
+            // ✅ একটানা duplicate পেজ এলে থেমে যাও
+            await logger.log(`  Page ${page} returned only duplicates — stopping.`);
+            hasMore = false;
+          } else {
+            allResults.push(...newPlaces);
+          }
+        }
 
         success = true;
         break;
@@ -68,10 +89,14 @@ async function fetchFromSerper(input: GoogleMapsSerperInput, ctx: ProviderRunCon
       }
     }
 
-    if (!success || allResults.length >= maxResults) break;
+    if (!success || !hasMore || allResults.length >= maxResults) break;
 
     page++;
     await sleep(1000);
+  }
+
+  if (page > MAX_PAGES) {
+    await logger.log(`  Reached max page limit (${MAX_PAGES}) — stopping with ${allResults.length} results.`);
   }
 
   return allResults.slice(0, maxResults);
