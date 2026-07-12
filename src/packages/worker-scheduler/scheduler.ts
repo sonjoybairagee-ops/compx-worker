@@ -16,7 +16,7 @@
 
 import { SupabaseClient } from "@supabase/supabase-js";
 import type { Queue } from "bullmq";
-import { getScrapeCache, buildCacheKey } from "@compx/scraper-core";
+import { buildCacheKey } from "@compx/scraper-core";
 import type { Redis } from "ioredis";
 
 const SCHEDULE_INTERVAL_MS = 60 * 60_000; // hourly
@@ -47,8 +47,6 @@ async function getPopularSearches(supabase: SupabaseClient): Promise<PopularSear
 }
 
 export function startScheduler(supabase: SupabaseClient, redis: Redis, discoverQueue: Queue) {
-  const cache = getScrapeCache(redis);
-
   const tick = async () => {
     try {
       const popular = await getPopularSearches(supabase);
