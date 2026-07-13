@@ -100,11 +100,24 @@ export class BrowserPool {
   }
 
   async acquireContext(launchOpts: LaunchOptions = {}): Promise<ContextLease> {
+    const resolvedOpts: LaunchOptions = {
+      ...launchOpts,
+      proxy:
+        launchOpts.proxy !== undefined
+          ? launchOpts.proxy
+          : process.env.PROXY_SERVER
+          ? {
+              server: process.env.PROXY_SERVER,
+              username: process.env.PROXY_USERNAME,
+              password: process.env.PROXY_PASSWORD,
+            }
+          : undefined,
+    };
     const slot = await this.getOrLaunchSlot();
     slot.inUseContexts++;
     this.contextsServed.set(slot.browser, (this.contextsServed.get(slot.browser) || 0) + 1);
 
-    const context = await createContext(slot.browser, launchOpts);
+    const context = await createContext(slot.browser, resolvedOpts);
 
     let released = false;
     const release = async () => {

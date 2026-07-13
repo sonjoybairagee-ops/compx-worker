@@ -12,7 +12,7 @@
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
     "worker": "node src/index.js",
-    "build": "npm run build -w src/packages/scraper-core && npm run build --workspaces --if-present"
+    "build": "npm run build --workspaces --if-present"
   },
   "dependencies": {
     "@bull-board/api": "^5.20.0",
