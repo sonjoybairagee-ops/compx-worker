@@ -1,18 +1,21 @@
 import { ProviderRouter, getCapabilityConfig } from "@compx/scraper-core";
-import { googleMapsSerperProvider, type GoogleMapsSerperInput } from "./providers/serper.js";
+import { googleMapsSerpApiProvider } from "./providers/serpapi.js";
+import { googleMapsOwnProvider } from "./providers/own.js";
+import type { GoogleMapsSerpApiInput } from "./providers/serpapi.js";
 
 const PROVIDER_MAP = {
-  "google-maps-serper": googleMapsSerperProvider,
+  "google-maps-own": googleMapsOwnProvider,
+  "google-maps-serpapi": googleMapsSerpApiProvider,
 };
 
-function buildRouter(): ProviderRouter<GoogleMapsSerperInput, any> {
+function buildRouter(): ProviderRouter<GoogleMapsSerpApiInput, any> {
   const { providers: names } = getCapabilityConfig("google_maps");
   const providers = names.map((n) => {
-    const p = (PROVIDER_MAP as Record<string, typeof googleMapsSerperProvider>)[n];
+    const p = (PROVIDER_MAP as Record<string, typeof googleMapsSerpApiProvider>)[n];
     if (!p) throw new Error(`[google_maps] Unknown provider "${n}" in capability registry`);
     return p;
   });
-  return new ProviderRouter<GoogleMapsSerperInput, any>(providers, { capability: "google_maps" });
+  return new ProviderRouter<GoogleMapsSerpApiInput, any>(providers, { capability: "google_maps" });
 }
 
 export const googleMapsRouter = buildRouter();

@@ -133,6 +133,34 @@ async function findWebsiteViaSerper(companyName) {
   }
 }
 
+/**
+ * Fallback scraper using Firecrawl API to bypass anti-bot protections
+ * and render JavaScript.
+ */
+async function tryFirecrawlScrape(url) {
+  const apiKey = process.env.FIRECRAWL_API_KEY;
+  if (!apiKey) return null;
+  try {
+    const res = await fetch("https://api.firecrawl.dev/v1/scrape", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ url, formats: ["markdown", "html"] })
+    });
+    if (!res.ok) {
+      const errText = await res.text();
+      console.warn(`[EnrichJob] Firecrawl API Error (${res.status}):`, errText);
+      return null;
+    }
+    return await res.json();
+  } catch (err) {
+    console.warn(`[EnrichJob] Firecrawl fallback failed for ${url}:`, err.message);
+    return null;
+  }
+}
+
 export async function runEnrichJob(input, userId) {
   const { website, name, domain } = input;
   let target = website || domain;
@@ -153,40 +181,68 @@ export async function runEnrichJob(input, userId) {
   const url = /^https?:\/\//i.test(target) ? target : `https://${target}`;
   const hostname = new URL(url).hostname.replace(/^www\./, "");
 
-  let page;
+  let html = "";
+  let text = "";
+  let usingFirecrawl = false;
+  let firecrawlData = null;
+
   try {
-    page = await fetchPage(url);
+    const page = await fetchPage(url);
+    if (!page.ok) throw new Error(`HTTP ${page.status}`);
+    html = page.html;
+    text = htmlToText(html);
   } catch (err) {
-    console.warn(`[EnrichJob] Fetch failed for ${url}:`, err.message);
-    return {
-      emails: [], phones: [], work_email: null, error: err.message,
-      website: discoveredWebsite || undefined,
-    };
+    console.warn(`[EnrichJob] Static fetch failed for ${url} (${err.message}), attempting Firecrawl fallback...`);
+    usingFirecrawl = true;
   }
 
-  if (!page.ok) {
-    return {
-      emails: [], phones: [], work_email: null, error: `HTTP ${page.status}`,
-      website: discoveredWebsite || undefined,
-    };
+  if (usingFirecrawl) {
+    firecrawlData = await tryFirecrawlScrape(url);
+    if (firecrawlData?.success && firecrawlData.data) {
+      html = firecrawlData.data.html || "";
+      text = firecrawlData.data.markdown || htmlToText(html);
+    } else {
+      return {
+        emails: [], phones: [], work_email: null, error: `Fetch failed and Firecrawl fallback failed`,
+        website: discoveredWebsite || undefined,
+      };
+    }
   }
 
-  const text = htmlToText(page.html);
-  const scrapedEmails = extractEmailsFromText(text).filter((e) => !isSocialDomain(e.split("@")[1] || ""));
+  let scrapedEmails = extractEmailsFromText(text).filter((e) => !isSocialDomain(e.split("@")[1] || ""));
   const phoneMatch = text.match(/(\+?\d[\d\s().-]{7,}\d)/);
-  const techStack = detectTechStack(page.html);
-  const socialLinks = extractSocialLinks(page.html, url);
-  const metaDescription = extractMetaDescription(page.html);
+  const techStack = detectTechStack(html);
+  const socialLinks = extractSocialLinks(html, url);
+  const metaDescription = extractMetaDescription(html);
 
   let workEmail = scrapedEmails[0] || null;
   let hunterUsed = false;
   let patternPredicted = false;
+  let firecrawlUsed = usingFirecrawl;
 
   if (!workEmail) {
     const hunterEmail = await tryHunterIo(hostname);
     if (hunterEmail) {
       workEmail = hunterEmail;
       hunterUsed = true;
+    }
+  }
+
+  // If we STILL don't have an email, and we haven't used Firecrawl yet, use it now as a last resort scrape
+  if (!workEmail && !firecrawlUsed) {
+    console.log(`[EnrichJob] No email found via static fetch or Hunter for ${url}, attempting Firecrawl fallback...`);
+    firecrawlData = await tryFirecrawlScrape(url);
+    if (firecrawlData?.success && firecrawlData.data) {
+      const fcHtml = firecrawlData.data.html || "";
+      const fcText = firecrawlData.data.markdown || htmlToText(fcHtml);
+      
+      const fcScrapedEmails = extractEmailsFromText(fcText).filter((e) => !isSocialDomain(e.split("@")[1] || ""));
+      if (fcScrapedEmails.length > 0) {
+        workEmail = fcScrapedEmails[0];
+        // Unique merge
+        scrapedEmails = [...new Set([...scrapedEmails, ...fcScrapedEmails])];
+        firecrawlUsed = true;
+      }
     }
   }
 
@@ -200,7 +256,7 @@ export async function runEnrichJob(input, userId) {
   }
 
   return {
-    emails: workEmail ? [workEmail, ...scrapedEmails.filter((e) => e !== workEmail)] : scrapedEmails,
+    emails: workEmail ? [...new Set([workEmail, ...scrapedEmails])] : scrapedEmails,
     phones: phoneMatch ? [phoneMatch[1].trim()] : [],
     work_email: workEmail,
     social_links: socialLinks,
@@ -209,6 +265,7 @@ export async function runEnrichJob(input, userId) {
     metaDescription,
     hunterUsed,
     patternPredicted,
+    firecrawlUsed,
     // When we discovered the website ourselves (input had none), hand the
     // hostname back so the caller can persist it — otherwise the same
     // lead has no website next time either and this lookup repeats forever.

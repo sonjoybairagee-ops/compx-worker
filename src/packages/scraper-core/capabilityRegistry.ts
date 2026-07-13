@@ -22,7 +22,7 @@ export type CapabilityConfig = {
 };
 
 const DEFAULT_REGISTRY: Record<string, CapabilityConfig> = {
-  google_maps: { providers: ["google-maps-serper"] },
+  google_maps: { providers: ["google-maps-own", "google-maps-serpapi"] },
   website: { providers: ["website-hybrid-crawler"] },
   // NOTE: Instagram profile-URL scraping (Playwright, direct URLs) is a
   // separate code path in plugins/instagram/index.ts, not registered here

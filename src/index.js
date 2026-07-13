@@ -1,5 +1,9 @@
 // worker/src/index.js
-import "dotenv/config";
+import dotenv from "dotenv";
+import path from "path";
+import { fileURLToPath } from "url";
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+dotenv.config({ path: path.resolve(__dirname, "../.env"), override: true });
 import { Worker, DelayedError } from "bullmq";
 import IORedis from "ioredis";
 import { runEnrichJob } from "./jobs/enrichJob.js";
@@ -90,7 +94,7 @@ async function processJob(job) {
   const proxy = await getProxyManager().getBest(routing);
 
   console.log(`[Worker] Job ${job.id} (${type}) → risk:${routing.riskLevel} proxy:${proxy?.id || "none"}`);
-  await sleep(routing.delayMs);
+  // await sleep(routing.delayMs); // Removed for real-time testing
 
   await supabase.from("jobs").update({ status: "running", started_at: new Date().toISOString() }).eq("id", job.id);
 
@@ -192,7 +196,7 @@ const worker = new Worker("compx-jobs", processJob, {
   connection: redis, concurrency: CONCURRENCY,
   stalledInterval: 120_000,
   lockDuration: 60_000,
-  limiter: { max: 5, duration: 60_000 },
+  // limiter: { max: 5, duration: 60_000 },
 });
 
 worker.on("completed", (job) => console.log(`[Worker] ✓ ${job.data.type || job.name} job ${job.id} complete`));
@@ -243,7 +247,7 @@ const leadEnrichWorker = new Worker("lead_enrichment", async (job) => {
   throw new Error(`Unknown enrichment kind: ${kind}`);
 }, {
   connection: redis, concurrency: 2,
-  limiter: { max: 10, duration: 60_000 },
+  // limiter: { max: 10, duration: 60_000 }, // Removed for real-time testing
 });
 leadEnrichWorker.on("completed", (job) => console.log(`[LeadEnrichment] ✓ ${job.data.kind} job ${job.id}`));
 leadEnrichWorker.on("failed", (job, err) => console.error(`[LeadEnrichment] ✗ ${job?.data?.kind} job ${job?.id}:`, err.message));
@@ -284,12 +288,52 @@ server.listen(WORKER_PORT, () => {
   console.log(`[Worker] 📊 Bull-Board & WS: http://localhost:${WORKER_PORT}/admin/queues`);
 });
 
+let shuttingDown = false;
+
 async function shutdown(signal) {
+  // Guard against SIGINT/SIGTERM firing twice (e.g. double Ctrl+C) and
+  // re-entering shutdown while it's already in progress.
+  if (shuttingDown) return;
+  shuttingDown = true;
+
   console.log(`[Worker] ${signal} received — shutting down gracefully`);
   stopScheduler();
+
+  // FIX: previously redis.quit() ran in the SAME Promise.allSettled() as
+  // worker.close()/leadEnrichWorker.close(). Those two calls wait for any
+  // in-flight job to finish (up to lockDuration), but redis.quit() closes
+  // the connection immediately and permanently — ioredis never
+  // reconnects after an explicit .quit(). So a job still running during
+  // shutdown would hit "Error: Connection is closed" on every Redis call
+  // (recordSuccess/recordFailure in the circuit breaker, dedupe locks,
+  // etc.) for however long it kept running afterward.
+  //
+  // Also wrapped in a timeout so a stuck job/browser-pool shutdown can't
+  // hang the process forever and block a deploy/restart.
+  const closeWithTimeout = (label, promise, ms = 15000) =>
+    Promise.race([
+      promise,
+      new Promise((resolve) =>
+        setTimeout(() => {
+          console.warn(`[Worker] ${label} did not close within ${ms}ms — continuing shutdown anyway`);
+          resolve(undefined);
+        }, ms)
+      ),
+    ]);
+
   await Promise.allSettled([
-    worker.close(), leadEnrichWorker.close(), getBrowserPool().shutdown(), redis.quit(),
+    closeWithTimeout("worker", worker.close()),
+    closeWithTimeout("leadEnrichWorker", leadEnrichWorker.close()),
+    closeWithTimeout("browserPool", getBrowserPool().shutdown()),
   ]);
+
+  // Only now, after the workers have stopped pulling/processing jobs
+  // (or the timeout fired), close Redis.
+  await redis.quit().catch((err) => {
+    console.warn("[Worker] redis.quit() failed, forcing disconnect:", err.message);
+    redis.disconnect();
+  });
+
   process.exit(0);
 }
 process.on("SIGTERM", () => shutdown("SIGTERM"));
