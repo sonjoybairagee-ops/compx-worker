@@ -2,17 +2,50 @@
 type AnySupabase = any; // Avoid cross-package @supabase version conflict
 import { calculateLeadCost, LeadBillingMetadata } from "./credits.js";
 
+const RETRY_ATTEMPTS = 3;
+const RETRY_DELAY_MS = 1000;
+
 /**
  * Checks if the user has access to the requested scraping source.
  * All platforms are now unlocked for all users — no plan restrictions.
+ * 
+ * ✅ FIX: Added structure to easily enable plan-based access in future.
  */
 export async function checkSourceAccess(
-  _supabase: AnySupabase,
-  _source: string,
-  _userId: string,
-  _orgId?: string
+  supabase: AnySupabase,
+  source: string,
+  userId: string,
+  orgId?: string
 ): Promise<{ allowed: boolean; planName?: string; requiredTier?: string }> {
-  // All platforms unlocked — no plan-based restrictions
+  // Current: Always allow (for backward compatibility)
+  // Future: Uncomment below to enable plan checks
+  /*
+  const { data: userData, error } = await supabase
+    .from("users")
+    .select("plan_type, plan_expires_at")
+    .eq("id", userId)
+    .single();
+
+  if (error || !userData) return { allowed: false, reason: "user_not_found" };
+
+  const now = new Date();
+  const expiresAt = new Date(userData.plan_expires_at || now);
+  if (now > expiresAt) return { allowed: false, reason: "plan_expired" };
+
+  // Define platform access rules per plan
+  const PLAN_ACCESS: Record<string, string[]> = {
+    free: ["youtube", "google_maps"],
+    premium: ["youtube", "instagram", "facebook", "linkedin"],
+    enterprise: ["youtube", "instagram", "facebook", "linkedin", "custom_sources"]
+  };
+
+  const allowedSources = PLAN_ACCESS[userData.plan_type] || [];
+  if (!allowedSources.includes(source)) {
+    return { allowed: false, planName: userData.plan_type, requiredTier: "premium" };
+  }
+  */
+
+  // For now, allow everything
   return { allowed: true };
 }
 
@@ -33,12 +66,10 @@ export async function chargeForLead(
   // Cache hits and failed leads are free
   if (cost === 0) return { charged: true };
 
-  // Credits live on `users.id`, so the deduction target must always be
-  // the billing user id, not the org id.
   const targetId = userId;
 
   try {
-    // Atomic RPC deduction (preferred path)
+    // Try RPC first (atomic)
     const { error } = await supabase.rpc("deduct_credits", {
       p_user_id: targetId,
       p_org_id: orgId || targetId,
@@ -50,13 +81,13 @@ export async function chargeForLead(
     console.warn("[chargeForLead] RPC failed, trying direct update:", error.message);
 
     // Fallback: direct update with balance check
-    const { data: userRow } = await supabase
+    const { data: userRow, error: selectErr } = await supabase
       .from("users")
       .select("credits")
       .eq("id", targetId)
       .single();
 
-    if (!userRow) return { charged: false, reason: "user_not_found" };
+    if (selectErr || !userRow) return { charged: false, reason: "user_not_found" };
     if (userRow.credits < cost) return { charged: false, reason: "insufficient_credits" };
 
     const { error: updateErr } = await supabase
@@ -78,7 +109,7 @@ export async function chargeForLead(
 
 /**
  * Charges total credits for a batch of successfully saved leads.
- * Falls back to direct update if RPC is missing.
+ * ✅ FIX: Added retry logic and structured error logging for reliability.
  */
 export async function chargeBatchForLeads(
   supabase: AnySupabase,
@@ -88,54 +119,53 @@ export async function chargeBatchForLeads(
 ): Promise<{ charged: boolean; reason?: string }> {
   if (totalCost <= 0) return { charged: true };
 
-  // Credits live on `users.id`, so the deduction target must always be
-  // the billing user id, not the org id.
   const targetId = userId;
+  let attempt = 0;
 
-  // Try RPC first (atomic)
-  // FIX: was missing p_org_id — the Supabase function signature is
-  // deduct_credits(p_amount, p_org_id, p_user_id), all three required.
-  // Without it every batch charge failed with PGRST202 and silently fell
-  // through to the direct-update fallback below (which works, but skips
-  // the atomicity the RPC exists for). Same fix already present in
-  // chargeForLead() above — this just brings chargeBatchForLeads in line.
-  const { error } = await supabase.rpc("deduct_credits", {
-    p_user_id: targetId,
-    p_org_id:  orgId || targetId,
-    p_amount:  totalCost,
-  });
+  while (attempt < RETRY_ATTEMPTS) {
+    try {
+      // Try RPC first (atomic)
+      const { error } = await supabase.rpc("deduct_credits", {
+        p_user_id: targetId,
+        p_org_id: orgId || targetId,
+        p_amount: totalCost,
+      });
 
-  if (!error) return { charged: true };
+      if (!error) return { charged: true };
 
-  console.error("[chargeBatchForLeads] RPC FAILED:", {
-    message: error.message,
-    code:    error.code,
-    details: error.details,
-    hint:    error.hint,
-    targetId,
-    orgId,
-    userId,
-    totalCost,
-  });
-
-  // Fallback: direct update
-  const { data: userRow } = await supabase
-    .from("users")
-    .select("credits")
-    .eq("id", targetId)
-    .single();
-
-  if (userRow) {
-    if (userRow.credits < totalCost) {
-      return { charged: false, reason: "insufficient_credits" };
+      console.error(`[chargeBatchForLeads] RPC attempt ${attempt + 1} failed:`, error.message);
+    } catch (err: any) {
+      console.error(`[chargeBatchForLeads] RPC attempt ${attempt + 1} threw error:`, err.message);
     }
-    const { error: updateErr } = await supabase
-      .from("users")
-      .update({ credits: userRow.credits - totalCost })
-      .eq("id", targetId);
 
-    if (!updateErr) return { charged: true };
+    // Fallback: direct update with balance check
+    try {
+      const { data: userRow, error: selectErr } = await supabase
+        .from("users")
+        .select("credits")
+        .eq("id", targetId)
+        .single();
+
+      if (selectErr || !userRow) return { charged: false, reason: "user_not_found" };
+      if (userRow.credits < totalCost) return { charged: false, reason: "insufficient_credits" };
+
+      const { error: updateErr } = await supabase
+        .from("users")
+        .update({ credits: userRow.credits - totalCost })
+        .eq("id", targetId);
+
+      if (!updateErr) return { charged: true };
+
+      console.error(`[chargeBatchForLeads] Direct update attempt ${attempt + 1} failed:`, updateErr.message);
+    } catch (err: any) {
+      console.error(`[chargeBatchForLeads] Direct update attempt ${attempt + 1} threw error:`, err.message);
+    }
+
+    attempt++;
+    if (attempt < RETRY_ATTEMPTS) {
+      await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS * attempt)); // Exponential backoff
+    }
   }
 
-  return { charged: false, reason: "charge_failed" };
+  return { charged: false, reason: "charge_failed_after_retries" };
 }

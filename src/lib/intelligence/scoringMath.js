@@ -47,6 +47,7 @@ export async function searchJobs(keyword, location) {
   return json.jobs_results || [];
 }
 
+
 export function groupByCompany(jobs) {
   const map = new Map();
   for (const job of jobs) {

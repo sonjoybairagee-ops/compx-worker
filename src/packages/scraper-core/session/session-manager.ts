@@ -3,8 +3,7 @@
  *
  * Phase 10 from the roadmap: per-platform session pools (Instagram Session
  * A/B/C/D, LinkedIn, Google — each platform's logged-in accounts rotated
- * independently). Did not exist in the old codebase — instagram/login.ts
- * style modules logged in fresh (or reused one hardcoded session) per job.
+ * independently).
  *
  * A "session" here = a Playwright storageState (cookies + localStorage)
  * persisted in Supabase, checked out for a job, checked back in (or
@@ -12,11 +11,12 @@
  */
 
 import { SupabaseClient } from "@supabase/supabase-js";
-import type { BrowserContext } from "playwright";
+import type { Browser, BrowserContext } from "playwright";
+import { createContext, type LaunchOptions } from "../browser/browser-manager.js";
 
 export interface SessionRecord {
   id: string;
-  platform: string; // "instagram" | "linkedin" | "google"
+  platform: string; // "instagram" | "linkedin" | "facebook" | "youtube"
   account_label: string; // "Session A", "Session B", ...
   storage_state: any; // Playwright storageState JSON
   status: "active" | "cooldown" | "banned";
@@ -27,18 +27,29 @@ export interface SessionRecord {
 
 export interface SessionLease {
   session: SessionRecord;
-  applyTo: (context: BrowserContext) => Promise<void>; // hydrate cookies into a fresh context — storageState is set at context-creation time in Playwright, this wraps that
   release: (opts?: { invalidate?: boolean; updatedState?: any }) => Promise<void>;
 }
 
-const COOLDOWN_MS = 15 * 60_000; // 15 min cooldown after a fail, before eligible again
+const COOLDOWN_MS = 15 * 60_000; // 15 min cooldown after a fail
 const MAX_FAILS_BEFORE_BAN = 3;
 
 export class SessionManager {
   constructor(private supabase: SupabaseClient, private table = "scraper_sessions") {}
 
-  /** Checks out the least-recently-used healthy session for a platform. Marks it in_use to prevent two jobs grabbing the same account concurrently. */
+  /** Checks out the least-recently-used healthy session for a platform. */
   async acquire(platform: string): Promise<SessionLease | null> {
+    // FIX: Auto-heal sessions that have been in cooldown for longer than COOLDOWN_MS
+    const cooldownThreshold = new Date(Date.now() - COOLDOWN_MS).toISOString();
+    
+    // First, try to reactivate any stuck cooldown sessions for this platform
+    await this.supabase
+      .from(this.table)
+      .update({ status: "active", fail_count: 0 })
+      .eq("platform", platform)
+      .eq("status", "cooldown")
+      .lt("last_used_at", cooldownThreshold);
+
+    // Now fetch the least recently used active session
     const { data: candidates, error } = await this.supabase
       .from(this.table)
       .select("*")
@@ -46,33 +57,27 @@ export class SessionManager {
       .eq("status", "active")
       .eq("in_use", false)
       .order("last_used_at", { ascending: true, nullsFirst: true })
-      .limit(5);
+      .limit(1); // FIX: Just take the top 1, no need for complex .find()
 
-    if (error) {
-      console.error("[SessionManager] load error:", error.message);
-      return null;
-    }
-
-    const eligible = (candidates || []).find((s) => {
-      if (s.status !== "active") return false;
-      if (!s.last_used_at) return true;
-      return Date.now() - new Date(s.last_used_at).getTime() > 0; // active sessions have no forced gap; cooldown handled via status
-    });
-
-    if (!eligible) {
+    if (error || !candidates || candidates.length === 0) {
       console.warn(`[SessionManager] No available session for platform "${platform}"`);
       return null;
     }
 
-    const { error: lockErr } = await this.supabase
+    const eligible = candidates[0] as SessionRecord;
+
+    // Optimistic lock — avoids two workers grabbing the same row
+    const { error: lockErr, data: lockData } = await this.supabase
       .from(this.table)
       .update({ in_use: true })
       .eq("id", eligible.id)
-      .eq("in_use", false); // optimistic lock — avoids two workers grabbing the same row
+      .eq("in_use", false) 
+      .select()
+      .maybeSingle();
 
-    if (lockErr) {
-      console.error("[SessionManager] lock error:", lockErr.message);
-      return null;
+    if (lockErr || !lockData) {
+      console.error("[SessionManager] lock error or race condition:", lockErr?.message || "Row was updated by another process");
+      return null; // Another worker got it, return null to let the job handle fallback/retry
     }
 
     let released = false;
@@ -83,6 +88,7 @@ export class SessionManager {
       if (opts.invalidate) {
         const nextFailCount = (eligible.fail_count || 0) + 1;
         const status = nextFailCount >= MAX_FAILS_BEFORE_BAN ? "banned" : "cooldown";
+        
         await this.supabase
           .from(this.table)
           .update({
@@ -93,18 +99,13 @@ export class SessionManager {
           })
           .eq("id", eligible.id);
 
-        if (status === "cooldown") {
-          setTimeout(() => {
-            this.supabase.from(this.table).update({ status: "active" }).eq("id", eligible.id).then(
-              () => {},
-              () => {}
-            );
-          }, COOLDOWN_MS);
-        }
+        // FIX: Removed dangerous setTimeout. The acquire() method will auto-heal 
+        // this session after COOLDOWN_MS passes.
         console.warn(`[SessionManager] Session ${eligible.account_label} invalidated → ${status} (fail_count: ${nextFailCount})`);
         return;
       }
 
+      // Success: reset fail count and update storage state if provided
       await this.supabase
         .from(this.table)
         .update({
@@ -117,33 +118,38 @@ export class SessionManager {
     };
 
     return {
-      session: eligible as SessionRecord,
-      applyTo: async () => {
-        /* storageState is applied at browser.newContext({ storageState }) time — see acquireContextWithSession() below */
-      },
+      session: eligible,
       release,
     };
   }
 
-  /** Convenience: acquire a session AND a hydrated context from the given browser in one call. */
+  /** 
+   * Convenience: acquire a session AND a hydrated context from the given browser in one call.
+   * This perfectly bridges SessionManager and BrowserPool.
+   */
   async acquireContextWithSession(
     platform: string,
-    browser: import("playwright").Browser,
-    extraContextOpts: Record<string, any> = {}
+    browser: Browser,
+    extraContextOpts: LaunchOptions = {}
   ): Promise<{ context: BrowserContext; lease: SessionLease } | null> {
     const lease = await this.acquire(platform);
     if (!lease) return null;
 
-    const context = await browser.newContext({
-      storageState: lease.session.storage_state || undefined,
+    const context = await createContext(browser, {
       ...extraContextOpts,
+      platform: platform as LaunchOptions["platform"],
+      storageState: lease.session.storage_state || undefined,
     });
 
     return { context, lease };
   }
 
+  /**
+   * Register a new session or update an existing one.
+   * NOTE: Requires a Unique Constraint on (platform, account_label) in Supabase.
+   */
   async registerSession(platform: string, accountLabel: string, storageState: any): Promise<void> {
-    await this.supabase.from(this.table).upsert(
+    const { error } = await this.supabase.from(this.table).upsert(
       {
         platform,
         account_label: accountLabel,
@@ -151,8 +157,14 @@ export class SessionManager {
         status: "active",
         in_use: false,
         fail_count: 0,
+        last_used_at: new Date().toISOString(),
       },
       { onConflict: "platform,account_label" }
     );
+
+    if (error) {
+      console.error(`[SessionManager] Failed to register session ${accountLabel}:`, error.message);
+      throw error;
+    }
   }
 }

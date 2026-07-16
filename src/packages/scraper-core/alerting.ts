@@ -1,30 +1,73 @@
-import type { Redis } from "ioredis";
+/**
+ * scraper-core/alerting.ts
+ *
+ * Slack alerting for circuit breaker state changes.
+ * Fully adapted for Supabase-only architecture (No Redis).
+ */
 
-export async function sendSlackAlert(provider: string, state: string, reason: string, redis: Redis) {
-  const webhookUrl = process.env.SLACK_ALERT_WEBHOOK_URL;
-  if (!webhookUrl) return;
+export async function sendSlackAlert(
+  provider: string, 
+  state: string, 
+  reason: string
+): Promise<void> {
+  const webhookUrl = process.env.SLACK_WEBHOOK_URL;
+  
+  if (!webhookUrl) {
+    console.warn(`[Alerting] SLACK_WEBHOOK_URL not configured. Skipping alert for ${provider} → ${state}`);
+    return;
+  }
 
   try {
-    // Deduplication check: prevent spam per state
-    const alertKey = `alert:${provider}:${state}`;
-    const locked = await redis.setnx(alertKey, "1");
-    
-    if (locked === 1) {
-      // Set TTL for 10 minutes so we don't spam if it keeps failing
-      await redis.expire(alertKey, 600);
+    const payload = {
+      text: `🚨 *Circuit Breaker Alert*`,
+      blocks: [
+        {
+          type: "header",
+          text: {
+            type: "plain_text",
+            text: state === "OPEN" ? "⚠️ Circuit Breaker OPENED" : "✅ Circuit Breaker RECOVERED"
+          }
+        },
+        {
+          type: "section",
+          fields: [
+            { type: "mrkdwn", text: `*Provider:*\n${provider}` },
+            { type: "mrkdwn", text: `*State:*\n${state}` }
+          ]
+        },
+        {
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text: `*Reason:*\n${reason}`
+          }
+        },
+        {
+          type: "context",
+          elements: [
+            {
+              type: "mrkdwn",
+              text: `<!date^${Math.floor(Date.now() / 1000)}^{date_short} at {time}|${new Date().toISOString()}>`
+            }
+          ]
+        }
+      ]
+    };
 
-      const message = {
-        text: `🚨 *Provider Alert*\n*Provider:* ${provider}\n*Status:* Circuit Breaker ${state}\n*Reason:* ${reason}`,
-      };
+    const response = await fetch(webhookUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(5000) // 5s timeout
+    });
 
-      await fetch(webhookUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(message),
-      });
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.warn(`[Alerting] Slack webhook failed (${response.status}):`, errorText);
+    } else {
+      console.log(`[Alerting] ✓ Slack alert sent for ${provider} → ${state}`);
     }
   } catch (err: any) {
-    // Fail silently if alerting fails, don't interrupt the main flow
-    console.error(`[Alerting] Failed to send slack alert for ${provider}:`, err.message);
+    console.warn(`[Alerting] Failed to send Slack alert:`, err.message);
   }
 }

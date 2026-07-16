@@ -1,13 +1,14 @@
 import { supabase } from "../config/supabase.js";
- // or wherever we put it, but wait, worker has no access to src/lib/fetchWithAuth...
-// I will just use standard fetch or supabase.
+// ✅ FIX: enqueueDripJob is in the frontend lib, not the worker.
+// In the worker, use boss.send() directly to schedule next step.
+import { getBoss, QUEUES } from "../config/pgboss.js";
 
 export async function runDripJob(jobData) {
   const { enrollment_id } = jobData;
 
   console.log(`[DripWorker] Processing enrollment ${enrollment_id}`);
 
-  // 1. Fetch enrollment
+  // 1. Fetch enrollment with joined data
   const { data: enrollment, error: enrollmentErr } = await supabase
     .from("sequence_enrollments")
     .select(`
@@ -23,35 +24,31 @@ export async function runDripJob(jobData) {
     return { error: "Enrollment not found" };
   }
 
-  // FIX: guard against the joined lead having been deleted since enrollment —
-  // otherwise `enrollment.leads_verified.email` below throws a TypeError.
+  // Guard against deleted lead
   if (!enrollment.leads_verified) {
-    console.error(`[DripWorker] Enrollment ${enrollment_id} has no linked lead (leads_verified) — likely deleted. Marking failed.`);
+    console.error(`[DripWorker] Lead missing for enrollment ${enrollment_id}. Marking failed.`);
     await supabase
       .from("sequence_enrollments")
-      .update({ status: "failed" })
+      .update({ status: "failed", error_msg: "Lead deleted" })
       .eq("id", enrollment.id);
     return { error: "lead_not_found" };
   }
 
-  // 2. Check if status is still active
+  // Check active status
   if (enrollment.status !== "active") {
-    console.log(`[DripWorker] Enrollment ${enrollment_id} is no longer active (status: ${enrollment.status}). Skipping.`);
+    console.log(`[DripWorker] Enrollment ${enrollment_id} is ${enrollment.status}. Skipping.`);
     return { skipped: true, reason: enrollment.status };
   }
 
   const step = enrollment.sequence_steps;
   if (!step) {
-    console.error(`[DripWorker] Step not found for enrollment ${enrollment_id}`);
+    console.error(`[DripWorker] Step missing for enrollment ${enrollment_id}`);
     return { error: "Step not found" };
   }
 
   const idempotency_key = `${enrollment.id}_${step.id}`;
 
-  // 3. Check Idempotency (prevent duplicate sends on crash)
-  // FIX: .single() errors on 0 rows, which is the expected/common case here
-  // (no prior send yet) — .maybeSingle() treats that as a clean null instead
-  // of a noisy/fragile error path.
+  // 2. Idempotency Check (Prevent duplicate sends)
   const { data: existingLog } = await supabase
     .from("email_logs")
     .select("id")
@@ -59,14 +56,10 @@ export async function runDripJob(jobData) {
     .maybeSingle();
 
   if (existingLog) {
-    console.log(`[DripWorker] Duplicate send prevented for ${idempotency_key}`);
+    console.log(`[DripWorker] Duplicate send prevented: ${idempotency_key}`);
+    // Still need to schedule next step even if this one was a dupe
   } else {
     console.log(`[DripWorker] Sending email for step ${step.step_order} to ${enrollment.leads_verified.email}`);
-    
-    // Here we would call the outreach API or run the actual send logic
-    // Since worker might not have all the Next.js API envs, it's safer to POST to the Next.js API internally
-    // or implement the send logic directly here if we have all the env vars.
-    // Let's implement an internal call to our API to avoid duplicating Spintax and OAuth logic.
     
     const APP_URL = process.env.NEXT_PUBLIC_BASE_URL || "http://localhost:3000";
     try {
@@ -82,24 +75,36 @@ export async function runDripJob(jobData) {
           lead_id: enrollment.leads_verified.id,
           idempotency_key
         }),
-        // FIX: no timeout previously — an unresponsive internal API could hang
-        // this job indefinitely (past BullMQ's stall/lock timeout).
-        signal: AbortSignal.timeout(20000),
+        signal: AbortSignal.timeout(20000), // 20s timeout prevents hanging
       });
 
       if (!response.ok) {
         const errorText = await response.text();
         throw new Error(`API returned ${response.status}: ${errorText}`);
       }
+      
+      // Log successful send attempt
+      await supabase.from("email_logs").insert({
+        enrollment_id: enrollment.id,
+        step_id: step.id,
+        lead_id: enrollment.leads_verified.id,
+        idempotency_key,
+        status: "sent",
+        sent_at: new Date().toISOString()
+      });
+      
     } catch (err) {
-      console.error(`[DripWorker] Failed to send email via API:`, err);
-      throw err; // BullMQ will retry
+      console.error(`[DripWorker] Send failed:`, err.message);
+      // Update enrollment to failed so it doesn't get retried indefinitely
+      await supabase
+        .from("sequence_enrollments")
+        .update({ status: "failed", error_msg: err.message })
+        .eq("id", enrollment.id);
+      throw err; // PGMQ will retry based on maxAttempts
     }
   }
 
-  // 4. Find next step
-  // FIX: same .single() → .maybeSingle() fix — "no next step" (last step in
-  // the sequence) is an expected, common outcome, not an error case.
+  // 3. Schedule Next Step or Complete Sequence
   const { data: nextStep } = await supabase
     .from("sequence_steps")
     .select("*")
@@ -110,24 +115,43 @@ export async function runDripJob(jobData) {
     .maybeSingle();
 
   if (nextStep) {
-    // Schedule next step
+    // Calculate next run date
     const nextRunAt = new Date();
-    nextRunAt.setDate(nextRunAt.getDate() + nextStep.wait_days);
+    nextRunAt.setDate(nextRunAt.getDate() + (nextStep.wait_days || 1));
 
+    // Update current state
     await supabase
       .from("sequence_enrollments")
       .update({
         current_step_id: nextStep.id,
-        next_run_at: nextRunAt.toISOString()
+        next_run_at: nextRunAt.toISOString(),
+        updated_at: new Date().toISOString()
       })
       .eq("id", enrollment.id);
       
-    console.log(`[DripWorker] Scheduled next step ${nextStep.step_order} for ${nextRunAt}`);
+    // ✅ FIX: Use boss.send() with startAfterSeconds for delayed next step
+    const boss = await getBoss();
+    const delaySeconds = (nextStep.wait_days || 1) * 24 * 60 * 60;
+    await boss.send(
+      QUEUES.DRIP_JOBS,
+      { enrollment_id: enrollment.id, step_id: nextStep.id },
+      {
+        id: `drip_${enrollment.id}_${nextStep.id}`,
+        startAfterSeconds: delaySeconds,
+        retryLimit: 2,
+      }
+    );
+    
+    console.log(`[DripWorker] Scheduled step ${nextStep.step_order} in ${nextStep.wait_days} days`);
   } else {
-    // Mark as completed
+    // No more steps → Mark completed
     await supabase
       .from("sequence_enrollments")
-      .update({ status: "completed" })
+      .update({ 
+        status: "completed", 
+        completed_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      })
       .eq("id", enrollment.id);
       
     console.log(`[DripWorker] Sequence completed for enrollment ${enrollment_id}`);

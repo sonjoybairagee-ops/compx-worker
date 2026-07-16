@@ -7,20 +7,13 @@
  *   BUG: lib/scrapingBrain.js::analyzeJobRisk() returned `proxyScoreThreshold`,
  *   but lib/proxy.js::getBestProxy() read `routing.minScore` — the field
  *   names never matched, so the min-score proxy filter silently never
- *   applied in production. lib/routingEngine.js (unused/dead code) had the
- *   correct `minScore` field name but was never imported anywhere.
+ *   applied in production.
  *
  *   FIX: this module defines one RoutingDecision shape with `minScore`, and
- *   the risk engine (routing-engine.ts, ported next) must produce it.
+ *   the risk engine must produce it.
  *
- *   FIX (Node 20 RealtimeClient WebSocket warning / DLQ failures): this
- *   getClient() singleton is called on EVERY job via getProxyManager() in
- *   worker/src/index.js's processJob(), regardless of platform — so it was
- *   the real root cause of "Node.js 20 detected without native WebSocket
- *   support" errors that were sending discover_scrape jobs straight to the
- *   DLQ, even though every individual plugin (amazon, google-maps, etc.)
- *   already had the `ws` transport fix applied. Same fix as everywhere
- *   else: pass `ws` as the realtime transport for Node < 22.
+ *   FIX (Node 20 RealtimeClient WebSocket warning): pass `ws` as the 
+ *   realtime transport for Node < 22 to prevent DLQ failures.
  */
 
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
@@ -66,27 +59,47 @@ export class ProxyManager {
   private cache: SystemProxy[] = [];
   private lastLoadedAt = 0;
   private readonly ttlMs: number;
+  private isLoading = false; // ✅ FIX: Prevent concurrent load attempts (thundering herd)
 
   constructor(ttlMs = 60_000) {
     this.ttlMs = ttlMs;
   }
 
   async load(force = false): Promise<void> {
-    if (!force && this.cache.length && Date.now() - this.lastLoadedAt < this.ttlMs) return;
-
-    const { data, error } = await getClient()
-      .from("system_proxies")
-      .select("*")
-      .eq("status", "active");
-
-    if (error) {
-      console.error("[ProxyManager] Failed to load proxies:", error.message);
+    // 1. If already loading, wait briefly for it to finish
+    if (this.isLoading) {
+      while (this.isLoading) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
       return;
     }
 
-    this.cache = data || [];
-    this.lastLoadedAt = Date.now();
-    console.log(`[ProxyManager] Loaded ${this.cache.length} active proxies`);
+    // 2. Check cache validity
+    if (!force && this.cache.length > 0 && Date.now() - this.lastLoadedAt < this.ttlMs) {
+      return;
+    }
+
+    this.isLoading = true;
+    try {
+      const { data, error } = await getClient()
+        .from("system_proxies")
+        .select("*")
+        .eq("status", "active");
+
+      if (error) {
+        console.error("[ProxyManager] Failed to load proxies:", error.message);
+        // ✅ CRITICAL FIX: Do NOT update lastLoadedAt on failure.
+        // This ensures the next call will retry fetching the proxies.
+        return;
+      }
+
+      // 3. Only update cache and timestamp on SUCCESS
+      this.cache = data || [];
+      this.lastLoadedAt = Date.now();
+      console.log(`[ProxyManager] Loaded ${this.cache.length} active proxies`);
+    } finally {
+      this.isLoading = false;
+    }
   }
 
   private score(p: SystemProxy): number {
@@ -111,8 +124,7 @@ export class ProxyManager {
 
     let scored: ScoredProxy[] = pool.map((p) => ({ ...p, score: this.score(p) }));
 
-    // FIX: this is the corrected field — `minScore`, matching RoutingDecision,
-    // not the old mismatched `proxyScoreThreshold`.
+    // FIX: this is the corrected field — `minScore`, matching RoutingDecision
     if (routing?.minScore !== undefined) {
       const filtered = scored.filter((p) => p.score >= (routing.minScore as number));
       if (filtered.length) scored = filtered;

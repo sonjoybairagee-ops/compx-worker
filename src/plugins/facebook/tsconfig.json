@@ -8,5 +8,5 @@
       "@supabase/supabase-js/*": ["../../../../node_modules/@supabase/supabase-js/*"]
     }
   },
-  "include": ["*.ts"]
+  "include": ["*.ts", "providers/**/*.ts"]
 }

@@ -1,29 +1,16 @@
 /**
  * scraper-core/storage/uploader.ts
  *
- * Generalizes worker/jobs/pipelineSave.js::saveToDatabaseLeads(). The old
- * version had per-platform `if (source === "youtube") {...} if (source ===
- * "instagram") {...}` blocks baked directly into the save function — adding
- * a new source (Facebook Pages, TikTok, etc., per the roadmap's stated goal)
- * meant editing this shared file. Now each plugin supplies its own
- * `RowMapper`, and this module only handles what's genuinely shared: batching,
- * upsert-vs-insert routing (website-present vs website-absent, keeping the
- * org_id||user_id NULL-conflict fix from the original), and error counting.
+ * Generalizes worker/jobs/pipelineSave.js::saveToDatabaseLeads(). 
+ * Now each plugin supplies its own RowMapper, and this module only handles 
+ * what's genuinely shared: batching, upsert-vs-insert routing, and error counting.
  *
- * FIX: added a garbage_bin dedup pass. Previously, a lead the user
- * manually (or Smart Clean Up) sent to garbage_bin would silently
- * reappear as a brand-new leads_staging row the next time the same
- * source/keyword was scraped — the website-based upsert only prevents
- * duplicates against rows still LIVE in leads_staging, not ones that were
- * deleted after being garbaged, and website-less leads (common for
- * YouTube/Instagram, which usually have no linked website) had no dedup
- * at all, not even against leads_staging itself. This checks the org's
- * garbage_bin (by website when present, by normalized company/name when
- * not) before inserting, and skips anything that was already thrown out.
+ * FIX: added a garbage_bin dedup pass with proper sorting to prioritize 
+ * recently garbaged leads, and added in-batch deduplication for website-less leads.
  */
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-type AnySupabase = any; // Avoid cross-package @supabase version conflict
+type AnySupabase = any; 
 import { normalizeWebsite } from "../parser/domain.js";
 
 export interface StagingRow {
@@ -52,31 +39,32 @@ export interface StagingRow {
   [key: string]: any;
 }
 
-/** Plugin-supplied function: raw scraped item → a leads_staging row. */
 export type RowMapper<T = any> = (item: T, userId: string, orgId: string | null) => StagingRow;
 
 export interface UploadResult {
   saved: number;
   errors: number;
-  /** DB-generated UUIDs of every row actually inserted/upserted into leads_staging. */
   savedIds: string[];
-  /** Rows skipped because they match something already in this org's garbage_bin. */
   skippedGarbage: number;
 }
 
 const BATCH_SIZE = 50;
-/** Safety cap on the garbage_bin dedup fetch — see note in fetchGarbageIdentities(). */
 const GARBAGE_FETCH_LIMIT = 5000;
 
-/** A baseline mapper covering the fields every source shares (name/company/website/socials). Plugins can spread this and add platform-specific fields on top rather than reimplementing it. */
+/** A baseline mapper covering the fields every source shares. */
 export function baseRowMapper(
   item: Record<string, any>,
   userId: string,
   orgId: string | null,
   source: string
 ): StagingRow {
+  // Support both camelCase and snake_case from different plugins
   const website = normalizeWebsite(item.website || item.domain);
   const company = item.company || item.name || item.title || null;
+  const contactName = item.contactName || item.contact_name || null;
+  const contactTitle = item.contactTitle || item.contact_title || null;
+  const linkedin = item.linkedin || item.linkedin_url || null;
+  const emailSource = item.emailSource || item.email_source || null;
 
   let defaultScore = 0;
   if (website) defaultScore += 30;
@@ -85,9 +73,9 @@ export function baseRowMapper(
   if (company) defaultScore += 10;
 
   const row: StagingRow = {
-    org_id: orgId || userId, // never null — see validator.ts::buildDedupKey
+    org_id: orgId || userId, 
     user_id: userId,
-    name: item.name || item.contactName || company,
+    name: item.name || contactName || company,
     company,
     industry: item.industry || item.category || null,
     website,
@@ -101,13 +89,15 @@ export function baseRowMapper(
   if (item.metaDescription || item.description || item.bio) {
     row.meta_description = item.metaDescription || item.description || item.bio;
   }
-  if (typeof item.isHiring === "boolean") row.is_hiring = item.isHiring;
+  if (typeof item.isHiring === "boolean" || typeof item.is_hiring === "boolean") {
+    row.is_hiring = item.isHiring ?? item.is_hiring;
+  }
   if (item.email) row.email = item.email;
   if (item.phone) row.phone = item.phone;
-  if (item.contactName) row.contact_name = item.contactName;
-  if (item.contactTitle) row.contact_title = item.contactTitle;
-  if (item.linkedin) row.linkedin_url = item.linkedin;
-  if (item.emailSource) row.email_source = item.emailSource;
+  if (contactName) row.contact_name = contactName;
+  if (contactTitle) row.contact_title = contactTitle;
+  if (linkedin) row.linkedin_url = linkedin;
+  if (emailSource) row.email_source = emailSource;
 
   return row;
 }
@@ -117,18 +107,8 @@ function normalizeCompanyKey(name: string | null | undefined): string {
 }
 
 /**
- * Fetch this org's garbage_bin identities (website + normalized company
- * name) for leads_staging-sourced entries, so saveLeads can skip
- * re-inserting anything already thrown out.
- *
- * NOTE: this pulls up to GARBAGE_FETCH_LIMIT rows per org per saveLeads()
- * call and builds the identity sets in memory (a jsonb `data->>field` path
- * isn't practical to batch-match via PostgREST's `.in()` — the simplest
- * robust option is fetching and filtering in JS). garbage_bin rows expire
- * after 30 days, so this stays naturally bounded, but if a single org
- * generates a very high garbage volume this could get slow — add a
- * dedicated (org_id, source_table) index and/or narrow the time window
- * (e.g. `.gte("created_at", ...)`) if that happens.
+ * Fetch this org's garbage_bin identities. 
+ * FIX: Added ordering to prioritize recently garbaged leads.
  */
 async function fetchGarbageIdentities(
   supabase: AnySupabase,
@@ -142,6 +122,7 @@ async function fetchGarbageIdentities(
     .select("data")
     .eq("org_id", orgId)
     .eq("source_table", "leads_staging")
+    .order("created_at", { ascending: false }) // ✅ FIX: Prioritize recent garbage
     .limit(GARBAGE_FETCH_LIMIT);
 
   if (error) {
@@ -153,6 +134,7 @@ async function fetchGarbageIdentities(
     const d = row?.data || {};
     const normalizedWebsite = normalizeWebsite(d.website);
     if (normalizedWebsite) websites.add(normalizedWebsite);
+    
     const companyKey = normalizeCompanyKey(d.company || d.name);
     if (companyKey) companies.add(companyKey);
   }
@@ -188,12 +170,23 @@ export async function saveLeads<T = any>(
   }
 
   const withWebsite = liveRows.filter((r) => r.website);
-  const withoutWebsite = liveRows.filter((r) => !r.website);
+  
+  // ✅ FIX: In-batch deduplication for leads WITHOUT a website to prevent duplicate inserts
+  const withoutWebsiteRaw = liveRows.filter((r) => !r.website);
+  const seenNoWebsite = new Set<string>();
+  const withoutWebsite = withoutWebsiteRaw.filter((r) => {
+    // Create a unique key based on source + email (or name if no email)
+    const uniqueKey = `${r.source}|${(r.email || r.name || '').toLowerCase().trim()}`;
+    if (seenNoWebsite.has(uniqueKey)) return false;
+    seenNoWebsite.add(uniqueKey);
+    return true;
+  });
 
   let saved = 0;
   let errors = 0;
   const savedIds: string[] = [];
 
+  // 1. Upsert leads WITH website
   for (let i = 0; i < withWebsite.length; i += BATCH_SIZE) {
     const batch = withWebsite.slice(i, i + BATCH_SIZE);
     const { data, error } = await supabase
@@ -212,6 +205,7 @@ export async function saveLeads<T = any>(
     }
   }
 
+  // 2. Insert leads WITHOUT website (deduped in-memory above)
   for (let i = 0; i < withoutWebsite.length; i += BATCH_SIZE) {
     const batch = withoutWebsite.slice(i, i + BATCH_SIZE);
     const { data, error } = await supabase.from("leads_staging").insert(batch).select("id");

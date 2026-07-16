@@ -64,3 +64,30 @@ create index if not exists idx_job_logs_job_id on job_logs (job_id, created_at);
 -- Run periodically (pg_cron or an external scheduled task):
 --   delete from job_logs where created_at < now() - interval '30 days';
 --   delete from search_log where created_at < now() - interval '90 days';
+
+-- ── Post-Redis Migration: jobs table billing_user_id ────────────────────────
+-- Required so poller.js can forward billing context to pg-boss workers.
+alter table jobs
+  add column if not exists billing_user_id uuid references auth.users(id);
+
+-- Index for fast lookup of pending jobs by created_at (poller ORDER BY)
+create index if not exists idx_jobs_status_created
+  on jobs (status, created_at asc)
+  where status = 'pending';
+
+-- ── Enable Supabase Realtime on jobs table ────────────────────────────────────
+-- Required for poller.js Realtime subscription (instant job pickup).
+-- Run in Supabase Dashboard → Table Editor → jobs → Enable Realtime,
+-- OR via SQL:
+alter publication supabase_realtime add table jobs;
+
+-- ── Lead Lifecycle: last_contacted_at on leads_verified ─────────────────────
+-- Tracks when a lead was last included in a campaign run.
+-- Used by: Pipeline page ("contacted X days ago") + 90-day re-engage cooldown.
+alter table leads_verified
+  add column if not exists last_contacted_at timestamptz;
+
+-- Fast lookup for Pipeline page "ready to re-engage" filter
+create index if not exists idx_leads_verified_pipeline_status
+  on leads_verified (pipeline_status, last_contacted_at)
+  where pipeline_status in ('contacted', 'enrolled', 'responded');

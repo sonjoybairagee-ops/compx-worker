@@ -151,25 +151,52 @@ async function run(ctx: PluginContext): Promise<PluginResult> {
     }
 
     // 2. Batch Details (channels.list)
+    // brandingSettings.channel.businessEmail — direct email from YouTube Data API
+    // No browser needed for channels that set their business email publicly
     await logger.log(`Fetching details for ${channelIds.length} channels...`);
-    const detailsRes = await fetch(`https://www.googleapis.com/youtube/v3/channels?part=snippet,statistics&id=${channelIds.join(',')}&key=${YOUTUBE_API_KEY}`);
+    const detailsRes = await fetch(
+      `https://www.googleapis.com/youtube/v3/channels` +
+      `?part=snippet,statistics,brandingSettings,contentDetails` +
+      `&id=${channelIds.join(",")}` +
+      `&key=${YOUTUBE_API_KEY}`
+    );
     let channelMap = new Map();
     if (detailsRes.ok) {
       const detailsData = await detailsRes.json();
       for (const item of (detailsData.items || [])) {
+        // ✅ YouTube Data API directly provides business email
+        const businessEmail = item.brandingSettings?.channel?.businessEmail || null;
+        const description = item.snippet?.description || "";
+
+        // Fallback: scan description text for emails (many creators put it there)
+        let descEmail: string | null = null;
+        if (!businessEmail && description) {
+          const emailMatch = description.match(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/);
+          descEmail = emailMatch?.[0] || null;
+        }
+
         channelMap.set(item.id, {
           channelName: item.snippet.title,
           name: item.snippet.title,
           company: item.snippet.title,
-          description: item.snippet.description,
-          country: item.snippet.country,
-          subscriberCount: item.statistics.subscriberCount,
-          channelUrl: item.snippet.customUrl ? `https://youtube.com/${item.snippet.customUrl}` : `https://youtube.com/channel/${item.id}`,
+          description,
+          country: item.snippet.country || null,
+          subscriberCount: item.statistics?.subscriberCount || null,
+          viewCount: item.statistics?.videoCount || null,
+          channelUrl: item.snippet.customUrl
+            ? `https://youtube.com/${item.snippet.customUrl}`
+            : `https://youtube.com/channel/${item.id}`,
           channelId: item.id,
-          source: "youtube"
+          // ✅ Email priority: brandingSettings → description scan → about page scraper
+          email: businessEmail || descEmail || null,
+          // ✅ Social links from brandingSettings
+          website: item.brandingSettings?.channel?.urls?.[0] || null,
+          source: "youtube",
+          _emailSource: businessEmail ? "api" : descEmail ? "description" : "pending_scrape",
         });
       }
     }
+
 
     const routing = analyzeJobRisk({ source: "youtube", type: "discover_scrape" });
     const proxy = await getProxyManager().getBest(routing);
@@ -180,18 +207,32 @@ async function run(ctx: PluginContext): Promise<PluginResult> {
       if (!record) continue;
 
       try {
+        const alreadyHasEmail = !!record.email;
+        if (alreadyHasEmail) {
+          await logger.log(`📧 ${record.channelName} → email from ${record._emailSource}: ${record.email}`);
+        }
         const { data: aboutResults, provider } = await youtubeRouter.fetch(
-          { channelId, channelUrl: record.channelUrl, proxyServer: proxy?.server },
+          {
+            channelId,
+            channelUrl: record.channelUrl,
+            proxyServer: proxy?.server,
+            alreadyHasEmail, // skip browser fallback if we already have email
+          },
           { jobId: ctx.jobId, logger, redis: ctx.redis }
         );
         const aboutData = aboutResults[0] || null;
         if (aboutData) {
-          await logger.log(`✓ ${record.channelName} (${provider})`);
-          record = { ...record, ...aboutData };
+          // Merge: API email wins, then about-page email, then existing
+          const mergedEmail = record.email || aboutData.email || null;
+          record = { ...record, ...aboutData, email: mergedEmail };
+          if (aboutData.email && !record.email) {
+            await logger.log(`✓ ${record.channelName} (${provider}) — email found via about page: ${aboutData.email}`);
+          }
         }
       } catch (err: any) {
         await logger.log(`✗ ${record.channelName} → ${err.message}`);
       }
+
 
       if (record) {
         const validation = validateLead(record);

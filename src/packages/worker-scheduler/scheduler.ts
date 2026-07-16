@@ -2,27 +2,19 @@
  * workers/scheduler/scheduler.ts
  *
  * Phase 16: "Scheduler → Popular Searches → Pre Scrape → Database Ready".
- * Did not exist in the old codebase. Runs on an interval inside the worker
- * process (no separate infra needed): looks at which (source, keyword,
- * location) combos got searched most in the last N days, and if the
- * Redis cache (storage/cache.ts) for that combo is cold or near-expiry,
- * queues a background discover_scrape job to refresh it — so the *next*
- * real user gets an instant cache hit instead of waiting on a live scrape.
- *
- * Reads from a `search_log` table that dispatchJob() should insert into on
- * every discover_scrape (one-line addition, see the hook note at the
- * bottom).
+ * Fully adapted for Supabase-only architecture (No Redis, No BullMQ).
+ * Uses pgBoss for job scheduling and Supabase cache table for TTL checks.
  */
 
 import { SupabaseClient } from "@supabase/supabase-js";
-import type { Queue } from "bullmq";
+import type PgBoss from "pg-boss";
 import { buildCacheKey } from "@compx/scraper-core";
-import type { Redis } from "ioredis";
 
 const SCHEDULE_INTERVAL_MS = 60 * 60_000; // hourly
 const LOOKBACK_DAYS = 7;
 const TOP_N_SEARCHES = 20;
-const REFRESH_THRESHOLD_TTL_SECONDS = 4 * 60 * 60; // refresh if cache has <4h left
+// Refresh if cache was updated more than 4 hours ago (equivalent to <4h TTL remaining)
+const CACHE_AGE_THRESHOLD_MS = 4 * 60 * 60 * 1000; 
 
 interface PopularSearch {
   source: string;
@@ -46,7 +38,44 @@ async function getPopularSearches(supabase: SupabaseClient): Promise<PopularSear
   return data || [];
 }
 
-export function startScheduler(supabase: SupabaseClient, redis: Redis, discoverQueue: Queue) {
+/**
+ * Checks if a cached entry needs refresh using Supabase scrape_cache table.
+ * Replaces redis.ttl() check with timestamp-based age calculation.
+ */
+async function needsCacheRefresh(
+  supabase: SupabaseClient, 
+  source: string, 
+  params: Record<string, any>
+): Promise<boolean> {
+  try {
+    const target = buildCacheKey(source, params);
+    
+    const { data, error } = await supabase
+      .from("scrape_cache")
+      .select("updated_at")
+      .eq("source", source)
+      .eq("target", target)
+      .single();
+
+    // If no cache exists or query failed, it's cold → needs refresh
+    if (error || !data) return true;
+
+    const lastUpdated = new Date(data.updated_at).getTime();
+    const ageMs = Date.now() - lastUpdated;
+    
+    // Needs refresh if older than threshold
+    return ageMs > CACHE_AGE_THRESHOLD_MS;
+  } catch (err) {
+    console.warn("[Scheduler] Cache check failed, assuming cold:", err);
+    return true; // Fail-safe: assume needs refresh on error
+  }
+}
+
+export function startScheduler(
+  supabase: SupabaseClient, 
+  boss: PgBoss, // ✅ Replaced BullMQ Queue with PgBoss instance
+  systemUserId: string // ✅ Required: pgBoss jobs need a valid user_id
+) {
   const tick = async () => {
     try {
       const popular = await getPopularSearches(supabase);
@@ -56,29 +85,28 @@ export function startScheduler(supabase: SupabaseClient, redis: Redis, discoverQ
 
       for (const search of popular) {
         const params = { keyword: search.keyword, location: search.location };
-        const key = buildCacheKey(search.source, params);
-        const ttl = await redis.ttl(key);
+        
+        // ✅ FIX: Check cache age via Supabase instead of Redis TTL
+        const shouldRefresh = await needsCacheRefresh(supabase, search.source, params);
+        if (!shouldRefresh) continue;
 
-        // ttl === -2 → key doesn't exist at all; -1 → exists with no expiry (shouldn't happen, we always set EX)
-        const needsRefresh = ttl === -2 || (ttl > 0 && ttl < REFRESH_THRESHOLD_TTL_SECONDS);
-        if (!needsRefresh) continue;
+        console.log(`[Scheduler] Pre-scraping "${search.keyword}" (${search.source}) — cache is stale/cold`);
 
-        console.log(`[Scheduler] Pre-scraping "${search.keyword}" (${search.source}) — cache ${ttl === -2 ? "cold" : `expiring in ${ttl}s`}`);
-
-        await discoverQueue.add(
-          "discover_scrape",
-          {
-            type: "discover_scrape",
-            user_id: "system_scheduler",
-            input_data: {
-              source: search.source,
-              keyword: search.keyword,
-              location: search.location,
-              _prescrape: true, // marks this as background, not user-triggered — dispatcher can skip credit deduction for these
-            },
+        // ✅ FIX: Use correct pg-boss queue name "compx-jobs" (not "discover_scrape")
+        await boss.send("compx-jobs", {
+          type: "discover_scrape",
+          user_id: systemUserId,
+          billing_user_id: systemUserId,
+          input_data: {
+            source: search.source,
+            keyword: search.keyword,
+            location: search.location,
+            _prescrape: true, // Dispatcher skips credit deduction for these
           },
-          { priority: 10 } // lower priority than real user jobs (BullMQ: lower number = higher priority)
-        );
+        }, {
+          priority: 10, // Lower priority than real user jobs
+          retryLimit: 1, // Pre-scrapes shouldn't retry endlessly
+        });
       }
     } catch (err: any) {
       console.error("[Scheduler] tick error:", err.message);
@@ -87,30 +115,9 @@ export function startScheduler(supabase: SupabaseClient, redis: Redis, discoverQ
 
   console.log(`[Scheduler] Started — checking popular searches every ${SCHEDULE_INTERVAL_MS / 60_000}min`);
   const interval = setInterval(tick, SCHEDULE_INTERVAL_MS);
-  tick(); // run once on boot
+  
+  // Run once on boot
+  tick().catch(err => console.error("[Scheduler] Initial tick failed:", err));
 
   return () => clearInterval(interval);
 }
-
-/**
- * DB HOOK — this SQL function needs to exist (adjust table/column names to
- * match your actual search-log schema):
- *
- *   create or replace function get_popular_searches(p_since timestamptz, p_limit int)
- *   returns table(source text, keyword text, location text, search_count bigint)
- *   language sql stable as $$
- *     select source, keyword, location, count(*) as search_count
- *     from search_log
- *     where created_at >= p_since
- *     group by source, keyword, location
- *     order by search_count desc
- *     limit p_limit;
- *   $$;
- *
- * DISPATCHER HOOK — one insert needed in dispatcher.js's dispatchJob(),
- * right after classifyJobType() resolves to "discover_scrape":
- *
- *   await supabase.from("search_log").insert({
- *     source: input.source, keyword: input.keyword, location: input.location || null,
- *   });
- */

@@ -12,13 +12,12 @@
     "@supabase/supabase-js": "^2.106.2"
   },
   "dependencies": {
-    "playwright": "^1.51.0",
     "crawlee": "^3.11.0",
-    "ioredis": "^5.4.1"
+    "playwright": "^1.51.0"
   },
   "devDependencies": {
     "@supabase/supabase-js": "^2.106.2",
-    "typescript": "^5.5.0",
-    "@types/node": "^20.14.0"
+    "@types/node": "^20.14.0",
+    "typescript": "^5.5.0"
   }
 }

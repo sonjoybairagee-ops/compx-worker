@@ -10,7 +10,7 @@
  *
  * Usage:
  *   const pool = getBrowserPool();
- *   const lease = await pool.acquireContext({ proxy });
+ *   const lease = await pool.acquireContext({ proxy, platform: 'instagram' });
  *   try {
  *     const page = await lease.context.newPage();
  *     ...
@@ -59,21 +59,41 @@ export class BrowserPool {
   }
 
   private async getOrLaunchSlot(): Promise<PoolSlot> {
-    // Reuse an existing under-capacity, non-stale slot first.
-    for (const slot of this.slots) {
+    // FIX: previously this returned the FIRST non-stale slot found, where
+    // "stale" only considered cumulative contexts served / age — never
+    // current concurrent load (inUseContexts). That meant every call
+    // piled onto slot 0 (since it's essentially never "stale" until it's
+    // served 50 contexts total) and the pool never actually launched a
+    // 2nd/3rd/4th browser under concurrent load, even with
+    // BROWSER_POOL_SIZE=4 — defeating the entire point of a pool sized
+    // for concurrency and creating heavy contention on one Chromium
+    // process instead.
+    //
+    // New behavior: launch a fresh browser (up to `size`) before reusing
+    // an existing one, so concurrent load actually spreads across the
+    // full pool. Once at capacity, pick the least-loaded non-stale slot
+    // rather than always the first.
+    const usable = this.slots.filter((slot) => {
       const served = this.contextsServed.get(slot.browser) || 0;
       const stale =
         served >= this.opts.maxContextsPerBrowser ||
         Date.now() - slot.launchedAt > this.opts.maxBrowserAgeMs;
-      if (!stale) return slot;
-    }
+      return !stale;
+    });
 
-    if (this.slots.length < this.opts.size) {
+    if (usable.length < this.opts.size) {
       const browser = await launchChromium();
       const slot: PoolSlot = { browser, inUseContexts: 0, launchedAt: Date.now() };
       this.slots.push(slot);
       this.contextsServed.set(browser, 0);
       return slot;
+    }
+
+    if (usable.length > 0) {
+      // Least-loaded first so concurrent contexts spread evenly instead
+      // of stacking on whichever slot happened to be first in the array.
+      usable.sort((a, b) => a.inUseContexts - b.inUseContexts);
+      return usable[0];
     }
 
     // Pool is full and every slot is either busy-but-fresh or stale-and-recycling.
@@ -90,6 +110,9 @@ export class BrowserPool {
         Date.now() - slot.launchedAt > this.opts.maxBrowserAgeMs);
 
     if (stale) {
+      // ✅ FIX: Added observability log to track browser recycling in production
+      console.log(`[BrowserPool] ♻️ Recycling browser (Served: ${served}, Age: ${Math.round((Date.now() - slot.launchedAt) / 1000)}s)`);
+      
       this.slots = this.slots.filter((s) => s !== slot);
       try {
         await slot.browser.close();
@@ -113,10 +136,12 @@ export class BrowserPool {
             }
           : undefined,
     };
+    
     const slot = await this.getOrLaunchSlot();
     slot.inUseContexts++;
     this.contextsServed.set(slot.browser, (this.contextsServed.get(slot.browser) || 0) + 1);
 
+    // This seamlessly passes 'platform', 'storageState', etc. to browser-manager.ts
     const context = await createContext(slot.browser, resolvedOpts);
 
     let released = false;

@@ -1,3 +1,5 @@
+import { extractEmailsFromText } from "@compx/scraper-core";
+
 export function parseFacebookSerpResult(result: any): Record<string, any> | null {
   if (!result.link || !result.link.includes("facebook.com/")) return null;
 
@@ -26,15 +28,6 @@ export function parseFacebookSerpResult(result: any): Record<string, any> | null
   const snippet = result.snippet || "";
 
   // ── Followers/Likes count ──────────────────────────────────
-  // FIX: was only checking `snippet`, but SerpApi puts the follower/like
-  // count in `displayed_link` instead (e.g. "50+ followers",
-  // "21.2K+ followers", "3.7K+ followers") — snippet is just the page's
-  // bio/description text and rarely mentions a follower count at all.
-  // Also the old regex required whitespace immediately after the number
-  // ("50 followers"), but the real format has a "+" in between
-  // ("50+ followers"), which it didn't account for — so even checking
-  // the right field, it would have missed every match. Now searches both
-  // displayed_link and snippet, and allows an optional "+".
   let followersCount: number | null = null;
   const statsSource = `${result.displayed_link || ""} ${snippet}`;
   const statsMatch = statsSource.match(/([\d.,]+[KMB]?)\+?\s*(likes|followers)/i);
@@ -48,7 +41,6 @@ export function parseFacebookSerpResult(result: any): Record<string, any> | null
   }
 
   // ── Category extraction from snippet/title ──────────────────
-  // Common patterns: "Restaurant · Dubai", "Marketing Agency · New York"
   let category: string | null = null;
   const categoryMatch = snippet.match(/^([A-Za-z &\/]+?)\s*[·•|]\s/) || 
                         result.title?.match(/\(([^)]+)\)/);
@@ -59,18 +51,29 @@ export function parseFacebookSerpResult(result: any): Record<string, any> | null
     }
   }
 
-  // ── Website from snippet ──────────────────────────────────
+  // ── FIX: Robust Website extraction from snippet ─────────────
+  // Google snippets often omit http/https. This regex catches domains like "nike.com" or "www.nike.com"
   let website: string | null = null;
-  const urlMatch = snippet.match(/https?:\/\/(?!(?:www\.)?facebook\.com)[^\s,)]+/);
-  if (urlMatch) {
-    website = urlMatch[0].replace(/[.,]$/, "");
+  const domainRegex = /(?:https?:\/\/)?(?:www\.)?([-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&//=]*))/gi;
+  const domainMatches = snippet.match(domainRegex);
+  if (domainMatches) {
+    const IGNORE_DOMAINS = ['facebook.com', 'instagram.com', 'youtube.com', 'twitter.com', 'x.com', 'tiktok.com', 'linkedin.com'];
+    const validDomain = domainMatches.find(d => {
+      const clean = d.replace(/^https?:\/\//, '').replace(/^www\./, '').toLowerCase();
+      return !IGNORE_DOMAINS.some(ignored => clean.includes(ignored));
+    });
+    if (validDomain) {
+      website = validDomain.startsWith('http') ? validDomain : `https://${validDomain}`;
+      // Clean trailing punctuation
+      website = website.replace(/[.,;]$/, "");
+    }
   }
 
   // ── Phone from snippet ────────────────────────────────────
   let phone: string | null = null;
-  const phoneMatch = snippet.match(/(\+?[\d][\d\s().-]{7,}\d)/);
+  const phoneMatch = snippet.match(/(?:\+?880|01)?[\d\s-]{8,11}|\+?[\d][\d\s().-]{7,}\d/);
   if (phoneMatch) {
-    phone = phoneMatch[1].trim();
+    phone = phoneMatch[0].trim();
   }
 
   return {

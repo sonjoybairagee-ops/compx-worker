@@ -1,38 +1,23 @@
 /**
  * worker/src/jobs/dispatcher.js
  *
- * Rebuilt after the worker/ folder deletion. Registry-only for
- * discover_scrape — the old discoverScrapeJob.js monolith is gone, so there
- * is no legacy fallback anymore. All 8 platforms (website, google_maps,
- * instagram, linkedin, youtube, amazon, facebook, ebay, tripadvisor) are
- * registered in @compx/worker-registry, so this should never hit the
- * "no plugin" branch in normal operation — it exists only to fail loudly
- * and clearly instead of crashing if a source is ever requested that
- * isn't registered.
+ * ⚠️  DEPRECATED — This file is no longer part of any active code path.
  *
- * FIX: SCRAPE_JOB_NAMES and DISCOVER_SOURCES below were never updated
- * when the eBay and Tripadvisor plugins were added (platforms.ts and
- * plugins/ebay|tripadvisor/index.ts already existed, but this file still
- * only listed the original 6). In the normal path this is harmless — the
- * job's `type` is always explicitly "discover_scrape" from /api/scrape,
- * so classifyJobType() returns early and never consults these sets. But
- * anything that classifies a job by `source` alone (no explicit `type`),
- * or that uses a platform's `jobName` value ("ebay-scrape",
- * "tripadvisor-scrape" from platforms.ts) as the job type, would silently
- * misclassify or throw "Unknown job type" for these two platforms only.
- * Added them for consistency with the other 6.
+ * Active flow (post-Redis migration):
+ *   Frontend  →  supabaseAdmin.from("jobs").insert()
+ *   Poller    →  poller.js polls jobs table → boss.send("compx-jobs", ...)
+ *   Worker    →  index.js boss.work("compx-jobs", ...) → processJob()
  *
- * UPDATED: removed the post-completion lump-sum credit deduction
- * (calculateCreditCost / CREDIT_WEIGHTS) that used to run here. It was
- * broken (2-arg `deduct_credits` call, missing `p_user_id`) and, even once
- * fixed, would have double-charged on top of the per-lead charging that
- * now happens INSIDE each plugin via `chargeForLead()` (see
- * scraper-core/credits.ts and each plugin's index.ts). Credits are spent
- * as leads are found, not once in bulk after the job finishes.
+ * This file used a separate "enrichment_jobs" table and a "realtime"
+ * execution path that was never connected to the pg-boss queue.
+ * It also imports from a path that no longer exists in this repo.
+ *
+ * TODO: Either delete this file or refactor it to use the jobs table
+ *       + boss.send() if the realtime (non-queued) execution path is needed.
  */
 
 import { supabase } from "../config/supabase.js";
-import { compxJobsQueue } from "../config/queueRegistry.js";
+import { enqueueCompxJob } from "../../../src/lib/queue.js"; 
 import { runEnrichJob } from "./enrichJob.js";
 import { runVerifyEmail } from "./verifyEmailJob.js";
 import { runPipelineFilter } from "./pipelineFilterJob.js";
@@ -40,7 +25,7 @@ import { getPlugin } from "@compx/worker-registry";
 import { getProxyManager, analyzeJobRisk } from "@compx/scraper-core";
 import { ENRICHMENT_COSTS } from "@compx/scraper-core";
 
-const DISABLED_JOBS = new Set(["hiring_signals", "webhook", "drip"]);
+const DISABLED_JOBS = new Set(["webhook", "drip"]);
 
 const SCRAPE_JOB_NAMES = new Set([
   "deep_scrape", "discover_scrape", "google-maps-scrape", "linkedin-scrape",
@@ -112,17 +97,27 @@ export async function dispatchJob(userId, input, mode = "realtime") {
 
   const job = await createJobRecord(userId, jobType, input, mode);
 
+  // ✅ FIX: Use PGMQ enqueue instead of BullMQ queue.add()
   if (mode === "queue") {
-    const queue = compxJobsQueue();
-    await queue.add(jobType, {
-      supabase_id: job.id, id: job.id, type: jobType, user_id: userId, input_data: input,
-    }, {
-      jobId: `sb_${job.id}`, attempts: 3, backoff: { type: "exponential", delay: 5000 },
-    });
-    console.log(`[Dispatcher] Queued job ${job.id} (${jobType}) → BullMQ`);
-    return { jobId: job.id, status: "queued" };
+    try {
+      await enqueueCompxJob(jobType, {
+        supabase_id: job.id, id: job.id, type: jobType, user_id: userId, input_data: input,
+      }, {
+        jobId: `sb_${job.id}`, attempts: 3, delay: 5000, // delay in ms for PGMQ
+      });
+      console.log(`[Dispatcher] Queued job ${job.id} (${jobType}) → PGMQ`);
+      return { jobId: job.id, status: "queued" };
+    } catch (err) {
+      console.error(`[Dispatcher] Failed to queue job ${job.id}:`, err.message);
+      // Fallback: mark as failed if queuing fails
+      await supabase.from("enrichment_jobs").update({
+        status: "failed", error_msg: `Queue failed: ${err.message}`, updated_at: new Date().toISOString(),
+      }).eq("id", job.id);
+      throw err;
+    }
   }
 
+  // Realtime execution path
   runJobWorker(job.id, userId, jobType, input).catch(async (err) => {
     console.error(`[Dispatcher] Worker error for ${job.id}:`, err.message);
     await supabase.from("enrichment_jobs").update({
@@ -163,7 +158,6 @@ async function runJobWorker(jobId, userId, jobType, input) {
         );
       }
       // Credit charging + plan gating now happen INSIDE plugin.run() itself
-      // (checkSourceAccess + chargeForLead, per lead) — nothing to do here.
       result = await plugin.run({
         userId,
         orgId: input.orgId ?? null,
@@ -210,15 +204,6 @@ async function runJobWorker(jobId, userId, jobType, input) {
   }
 }
 
-// FIX: this loop called runEnrichJob() directly with zero credit deduction
-// AND with no error handling — a single domain throwing would crash the
-// entire batch (see try/catch added below). Billing policy (confirmed):
-// attempt-based — charge once a lookup actually completes, whether or not
-// it found an email (Hunter/Serper/proxy cost is spent either way). Only
-// a genuine system failure (thrown exception) is free, since nothing
-// completed. This job type has no retry loop (each domain runs once), so
-// there's no risk of double-charging across attempts the way there is in
-// pipelineFilterJob.js.
 async function chargeEnrichAttempt(userId, orgId) {
   const amount = ENRICHMENT_COSTS.website_enrichment;
   try {
@@ -251,7 +236,7 @@ async function runEnrichPipeline(domains, userId, jobId, routing, orgId) {
     try {
       const r = await runEnrichJob({ website: domain, domain }, userId);
       if (r) results.push(r);
-      await chargeEnrichAttempt(userId, orgId); // completed — charge whether or not an email was found
+      await chargeEnrichAttempt(userId, orgId);
     } catch (err) {
       console.error(`[Dispatcher] runEnrichJob failed for ${domain} (not charged):`, err.message);
     }

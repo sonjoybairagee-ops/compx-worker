@@ -1,97 +1,135 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 
+/**
+ * Base scraping costs per source.
+ * Must match CREDIT_COSTS in src/utils/plans.ts for UI consistency.
+ */
 export const BASE_SCRAPE_COSTS: Record<string, number> = {
-  // Must match CREDIT_COSTS in src/utils/plans.ts
-  website:     2,  // website_scrape
-  websites:    2,  // alias
-  google_maps: 1,  // google_maps_scrape
-  youtube:     2,  // youtube_scrape
-  instagram:   2,  // instagram_scrape (instagram_biz alias)
-  instagram_biz: 2,
-  facebook:    2,  // facebook_scrape
-  linkedin:    4,  // linkedin_scrape
-  amazon:      4,  // amazon_scrape
-  ebay:        2,  // ebay_scrape
-  tripadvisor: 3,  // tripadvisor_scrape
+  website:      2,
+  websites:     2, // alias
+  google_maps:  1,
+  youtube:      2,
+  instagram:    2,
+  instagram_biz: 2, // alias
+  facebook:     2,
+  linkedin:     4,
+  amazon:       4,
+  ebay:         2,
+  tripadvisor:  3,
 };
 
+/**
+ * Enrichment costs. Keys must match input.enrichments keys exactly.
+ */
 export const ENRICHMENT_COSTS: Record<string, number> = {
-  email: 2, // mapped from input.enrichments.email
-  email_verify: 2,
-  bulk_email_verify: 1,
-  website_enrichment: 2,
+  email:                 2,
+  email_verify:          2,
+  bulk_email_verify:     1,
+  website_enrichment:    2,
   bulk_website_enrichment: 1,
-  bulk_enrichment: 1,
-  force_reenrichment: 2,
-  company_enrichment: 2,
-  ai: 1, // mapped from input.enrichments.ai
-  ai_score: 1,
-  ai_summary: 1,
-  ai_icebreaker: 1,
-  ai_company_insights: 2,
-  ai_review_sentiment: 2,
-  phone_enrichment: 2,
-  hiring_signal: 2,
-  tech: 2, // mapped from input.enrichments.tech
-  tech_stack: 2,
+  bulk_enrichment:       1,
+  force_reenrichment:    2,
+  company_enrichment:    2,
+  ai:                    1,
+  ai_score:              1,
+  ai_summary:            1,
+  ai_icebreaker:         1,
+  ai_company_insights:   2,
+  ai_review_sentiment:   2,
+  phone_enrichment:      2,
+  hiring_signal:         2,
+  tech:                  2,
+  tech_stack:            2,
 };
 
 export interface LeadBillingMetadata {
   isCacheHit?: boolean;
-  enrichments?: string[]; // Array of enrichment keys from ENRICHMENT_COSTS
+  enrichments?: string[];
   isFailed?: boolean;
   isPartial?: boolean;
-  status?: 'SUCCESS' | 'PARTIAL' | 'FAILED' | 'NO_DATA' | 'SYSTEM_ERROR' | 'RATE_LIMITED' | 'CACHE_HIT' | 'PROXY_ERROR' | 'TIMEOUT' | 'INTERNAL_ERROR';
+  status?: 
+    | 'SUCCESS' 
+    | 'PARTIAL' 
+    | 'FAILED' 
+    | 'NO_DATA' 
+    | 'SYSTEM_ERROR' 
+    | 'RATE_LIMITED' 
+    | 'CACHE_HIT' 
+    | 'PROXY_ERROR' 
+    | 'TIMEOUT' 
+    | 'INTERNAL_ERROR';
 }
 
+/**
+ * Gets base cost for a source with safe normalization.
+ */
 export function getBaseCost(source: string): number {
-  // Normalize source name (e.g. google-maps -> google_maps)
-  const normalized = source.replace("-", "_");
-  return BASE_SCRAPE_COSTS[normalized] ?? 1; // Default to 1 if not found
+  const normalized = source.toLowerCase().replace(/[-\s]+/g, "_");
+  return BASE_SCRAPE_COSTS[normalized] ?? 1; // Default fallback to prevent $0 charges
 }
 
+/**
+ * Calculates cost for a single lead based on success-based billing.
+ * System failures = 0 credits. NO_DATA = Full charge (crawl completed).
+ */
 export function calculateLeadCost(source: string, metadata?: LeadBillingMetadata): number {
-  // Success-Based & Hybrid Billing: System failures = 0, but NO_DATA (crawl completed but nothing found) = Full
+  // ✅ FIX: Explicitly handle NO_DATA as full charge (user's request was fulfilled, just no results)
+  if (metadata?.status === 'NO_DATA') {
+    let baseCredits = getBaseCost(source);
+    let enrichmentCredits = 0;
+    
+    if (metadata?.enrichments?.length) {
+      for (const e of metadata.enrichments) {
+        enrichmentCredits += ENRICHMENT_COSTS[e] ?? 0;
+      }
+    }
+    return baseCredits + enrichmentCredits;
+  }
+
+  // Zero-cost scenarios: system failures or cache hits
+  const zeroCostStatuses = [
+    'FAILED', 'SYSTEM_ERROR', 'RATE_LIMITED', 
+    'PROXY_ERROR', 'TIMEOUT', 'INTERNAL_ERROR'
+  ];
+
   if (
     metadata?.isFailed || 
-    metadata?.status === 'FAILED' || 
-    metadata?.status === 'SYSTEM_ERROR' || 
-    metadata?.status === 'RATE_LIMITED' ||
-    metadata?.status === 'PROXY_ERROR' ||
-    metadata?.status === 'TIMEOUT' ||
-    metadata?.status === 'INTERNAL_ERROR'
-  ) return 0;
+    (metadata?.status && zeroCostStatuses.includes(metadata.status)) ||
+    metadata?.isCacheHit || 
+    metadata?.status === 'CACHE_HIT'
+  ) {
+    return 0;
+  }
 
-  // Cache hit is now free
-  if (metadata?.isCacheHit || metadata?.status === 'CACHE_HIT') return 0;
+  // Calculate base + enrichment costs
+  let totalCost = getBaseCost(source);
 
-  let baseCredits = getBaseCost(source);
-  let enrichmentCredits = 0;
-
-  if (metadata?.enrichments && metadata.enrichments.length > 0) {
+  if (metadata?.enrichments?.length) {
     for (const enrichment of metadata.enrichments) {
-      enrichmentCredits += (ENRICHMENT_COSTS[enrichment] ?? 0);
+      totalCost += ENRICHMENT_COSTS[enrichment] ?? 0;
     }
   }
 
-  let totalCost = baseCredits + enrichmentCredits;
-
-  // Partial success logic (50% charge)
+  // Partial success = 50% discount (rounded up)
   if (metadata?.isPartial || metadata?.status === 'PARTIAL') {
-    totalCost = Math.ceil(totalCost * 0.5);
+    return Math.ceil(totalCost * 0.5);
   }
 
   return totalCost;
 }
 
+/**
+ * Calculates batch cost with volume discounts.
+ * Used for upfront pricing estimates, NOT for actual deduction.
+ */
 export function calculateBatchCost(count: number, costPerLead: number): number {
-  if (count <= 0) return 0;
+  if (count <= 0 || costPerLead <= 0) return 0;
   
-  // Bulk Discount Multipliers
+  // Volume discount tiers
   let multiplier = 1.0;
-  if (count > 2000) multiplier = 0.85;
-  else if (count > 500) multiplier = 0.90;
-  else if (count > 100) multiplier = 0.95;
+  if (count > 2000)      multiplier = 0.85; // 15% off
+  else if (count > 500)  multiplier = 0.90; // 10% off
+  else if (count > 100)  multiplier = 0.95; // 5% off
 
   return Math.ceil(count * costPerLead * multiplier);
 }
