@@ -8,7 +8,7 @@
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
     "worker": "node src/index.js",
-    "build": "echo worker: nothing to build"
+    "build": "node build-all.mjs"
   },
   "dependencies": {
     "@compx/scraper-core": "file:./src/packages/scraper-core",

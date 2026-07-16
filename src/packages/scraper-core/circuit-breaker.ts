@@ -10,6 +10,8 @@ export const CIRCUIT_BREAKER_CONFIG = {
   FAILURE_THRESHOLD: 0.8, // 80%
   OPEN_TIME_MS: 600_000,  // 10 minutes
   HALF_OPEN_MAX: 1,
+  RETRY_COUNT: 3,
+  BACKOFF: [1000, 2000, 5000],
 };
 
 export type CircuitState = "CLOSED" | "OPEN" | "HALF_OPEN";

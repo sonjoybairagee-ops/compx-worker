@@ -11,7 +11,15 @@
  * (optimistic locking, stealth fingerprint, residential proxy).
  */
 
-import { getBrowserPool, SessionManager } from "@compx/scraper-core";
+import {
+  getBrowserPool,
+  SessionManager,
+  saveLeads,
+  baseRowMapper,
+  calculateLeadCost,
+  chargeBatchForLeads,
+} from "@compx/scraper-core";
+import type { PluginContext, PluginResult, SourcePlugin } from "@compx/scraper-core";
 import { createClient } from "@supabase/supabase-js";
 import ws from "ws";
 
@@ -259,11 +267,56 @@ async function scrapeInstagramProfiles(input: any): Promise<any[]> {
   }
 }
 
+async function run(ctx: PluginContext): Promise<PluginResult> {
+  const input = ctx.input;
+  const actualInput: InstagramScraperInput = input.input || input.data || input;
+  const activeEnrichments = Object.keys(actualInput.instagramFilters || {}).filter(
+    (k) => (actualInput.instagramFilters as any)[k] === true
+  );
+
+  const supabase = getSupabase();
+
+  // Run the scraper
+  const results = await scrapeInstagramProfiles(ctx);
+
+  // Save Leads
+  const uploadResult = await saveLeads(
+    supabase,
+    results,
+    ctx.userId,
+    ctx.orgId,
+    (item, userId, orgId) => baseRowMapper(item, userId, orgId, "instagram")
+  );
+
+  // Enrichment Dispatch
+  for (const item of results) {
+    if (item.website && activeEnrichments.includes("website") && ctx.dispatchEnrichment) {
+      await ctx.dispatchEnrichment("website", { domain: item.website });
+    }
+  }
+
+  // Charge on Success
+  if (uploadResult.saved > 0) {
+    const costPerLead = calculateLeadCost("instagram", { isCacheHit: false, enrichments: [] });
+    const totalCost = costPerLead * uploadResult.saved;
+    const chargeResult = await chargeBatchForLeads(supabase, ctx.userId, ctx.orgId, totalCost);
+    if (!chargeResult.charged) {
+      console.error(`[Instagram] Failed to charge ${totalCost} credits: ${chargeResult.reason}`);
+    }
+  }
+
+  return {
+    leads_found: results.length,
+    saved: uploadResult.saved,
+    errors: uploadResult.errors,
+  };
+}
+
 // ─── Plugin export (matches worker-registry contract) ────────────────────────
-export const instagramPlugin = {
+export const instagramPlugin: SourcePlugin = {
   name: "instagram-profile-scraper",
-  run: async (input: any, _ctx?: any) => scrapeInstagramProfiles(input),
-  fetch: async (input: any, _ctx?: any) => scrapeInstagramProfiles(input),
+  requiresBrowser: true,
+  run,
 };
 
 export const instagramProfileScraperProvider = instagramPlugin;
